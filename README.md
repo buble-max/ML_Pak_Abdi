@@ -54,8 +54,43 @@ Tiga sumber dataset yang didukung sistem:
    yang paling realistis karena kondisi pencahayaan, sudut kamera, dan
    karakteristik tangan pengguna persis sama dengan saat inference.
 
+**Import dataset dari Google Drive (Colab).**
+Di Google Colab, dataset tambahan (misal klip gesture kata) tidak perlu
+di-upload manual lewat `files.upload()`. Notebook
+`training/train_colab.ipynb` melakukan `drive.mount('/content/drive')`
+lalu memanggil helper `dataset/download_from_drive.py` yang:
+- Mengunduh ZIP dari link Google Drive via `gdown` (file ID auto-terdeteksi
+  dari URL `drive.google.com/file/d/<FILE_ID>/view`).
+- Membuat folder dataset kalau belum ada.
+- Mengekstrak ZIP ke direktori target.
+- Menghapus ZIP sementara setelah ekstraksi.
+- Memvalidasi subfolder wajib (mis. `raw_words/`) sudah terbentuk.
+
+Pemakaian programatis:
+```python
+from dataset.download_from_drive import download_and_extract
+download_and_extract(
+    file_id_or_url="https://drive.google.com/file/d/<FILE_ID>/view",
+    extract_to="dataset",
+    expected_subdirs=["raw_words"],
+)
+```
+Atau CLI:
+```bash
+python -m dataset.download_from_drive \
+    --url "https://drive.google.com/file/d/<FILE_ID>/view" \
+    --out dataset --expect raw_words
+```
+
 ### 2. Preprocessing
-- Ekstraksi **21 landmark tangan** (x, y, z) menggunakan MediaPipe Hand Landmarker.
+- Ekstraksi **21 landmark tangan** (x, y, z) menggunakan **MediaPipe Tasks API**
+  (`HandLandmarker` + `hand_landmarker.task`). API lama `mp.solutions.hands`
+  sudah dihapus pada MediaPipe terbaru (Python 3.12); pipeline kami
+  menggunakan `HandLandmarker.detect()` (mode IMAGE) dan
+  `HandLandmarker.detect_for_video()` (mode VIDEO) — lihat
+  `preprocessing/mp_hand_landmarker.py`.
+- Model asset `hand_landmarker.task` diunduh otomatis ke `model/mp_assets/`
+  saat pertama kali dibutuhkan.
 - **Normalisasi** terhadap wrist (titik 0) dan jarak wrist↔middle-MCP untuk
   menghilangkan pengaruh posisi, ukuran tangan, dan jarak kamera.
 - Konversi gambar statis → sequence temporal dengan **sliding window** (default T=30).
