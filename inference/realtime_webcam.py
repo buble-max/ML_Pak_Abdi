@@ -2,8 +2,13 @@
 Real-time webcam inference BISINDO.
 
 Loop:
-    Capture frame → MediaPipe → 21 landmark → normalisasi → SequenceBuffer
+    Capture frame → MediaPipe Tasks API (HandLandmarker, mode VIDEO)
+    → 21 landmark → normalisasi → SequenceBuffer
     → (jika T frame penuh) predict_smooth → overlay label + confidence.
+
+Migrasi: menggunakan MediaPipe Tasks API (`HandLandmarker`) karena
+`mp.solutions.hands` sudah tidak tersedia pada MediaPipe terbaru
+(Python 3.12).
 
 Keyboard:
     q   : quit
@@ -20,13 +25,12 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from config import (  # noqa: E402
-    MAX_HANDS,
-    MP_MAX_NUM_HANDS,
-    MP_MIN_DETECTION_CONFIDENCE,
-    MP_MIN_TRACKING_CONFIDENCE,
-)
+from config import MAX_HANDS  # noqa: E402
 from inference.predictor import BisindoPredictor  # noqa: E402
+from preprocessing.mp_hand_landmarker import (  # noqa: E402
+    HandLandmarkerWrapper,
+    draw_hand_landmarks,
+)
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from preprocessing.sequence_builder import SequenceBuffer  # noqa: E402
 
@@ -55,27 +59,21 @@ def _draw_overlay(frame, label: str, conf: float, fps: float) -> None:
 
 
 def main() -> None:
-    import mediapipe as mp
-
     predictor = BisindoPredictor()
     buf = SequenceBuffer()
 
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=MP_MAX_NUM_HANDS,
-        min_detection_confidence=MP_MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=MP_MIN_TRACKING_CONFIDENCE,
-    )
-    drawer = mp.solutions.drawing_utils
-    connections = mp.solutions.hands.HAND_CONNECTIONS
+    # MediaPipe Tasks API mode VIDEO untuk streaming webcam.
+    landmarker = HandLandmarkerWrapper(running_mode="video")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[error] Webcam tidak dapat dibuka")
+        landmarker.close()
         return
 
     label, conf = "...", 0.0
     t_prev = time.time()
+    t_start = time.time()
     fps = 0.0
 
     try:
@@ -84,18 +82,14 @@ def main() -> None:
             if not ok:
                 break
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = hands.process(rgb)
 
-            hand_arrays = []
-            if res.multi_hand_landmarks:
-                for hand_lms in res.multi_hand_landmarks:
-                    arr = np.array(
-                        [[p.x, p.y, p.z] for p in hand_lms.landmark],
-                        dtype=np.float32,
-                    )
-                    hand_arrays.append(arr)
-                    drawer.draw_landmarks(frame, hand_lms, connections)
+            # Timestamp monotonic yang diperlukan mode VIDEO
+            ts_ms = int((time.time() - t_start) * 1000)
+            hand_arrays = landmarker.detect_bgr(frame, timestamp_ms=ts_ms)
+
+            # Gambar landmark (helper manual karena solutions.drawing_utils
+            # tidak tersedia pada Tasks API).
+            draw_hand_landmarks(frame, hand_arrays)
 
             normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)
             buf.push(flatten_frame(normed))
@@ -104,7 +98,7 @@ def main() -> None:
                 sequence = buf.get()
                 label, conf, _ = predictor.predict_smooth(sequence)
 
-            # FPS
+            # FPS (EMA)
             now = time.time()
             dt = now - t_prev
             t_prev = now
@@ -124,7 +118,7 @@ def main() -> None:
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        hands.close()
+        landmarker.close()
 
 
 if __name__ == "__main__":

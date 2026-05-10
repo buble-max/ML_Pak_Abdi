@@ -40,6 +40,7 @@ from config import (  # noqa: E402
     SEQUENCE_LENGTH,
 )
 from inference.predictor import BisindoPredictor  # noqa: E402
+from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper  # noqa: E402
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from preprocessing.sequence_builder import SequenceBuffer  # noqa: E402
 from utils.labels import load_labels  # noqa: E402
@@ -77,17 +78,14 @@ def _get_predictor() -> BisindoPredictor:
     return _predictor
 
 
-def _get_mp_hands():
-    """Lazy init MediaPipe Hands (static image mode = True untuk /predict/frame)."""
-    if not hasattr(_get_mp_hands, "_inst"):
-        import mediapipe as mp
-        _get_mp_hands._inst = mp.solutions.hands.Hands(
-            static_image_mode=True,
-            max_num_hands=MAX_HANDS,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-    return _get_mp_hands._inst
+def _get_landmarker() -> HandLandmarkerWrapper:
+    """
+    Lazy init HandLandmarker (MediaPipe Tasks API) dalam mode IMAGE karena
+    setiap request HTTP membawa frame independen (bukan stream).
+    """
+    if not hasattr(_get_landmarker, "_inst"):
+        _get_landmarker._inst = HandLandmarkerWrapper(running_mode="image")
+    return _get_landmarker._inst
 
 
 def _decode_image(b64: str) -> np.ndarray:
@@ -104,17 +102,13 @@ def _decode_image(b64: str) -> np.ndarray:
 
 
 def _frame_to_landmarks(img_bgr: np.ndarray) -> np.ndarray:
-    import cv2
-    hands = _get_mp_hands()
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    res = hands.process(rgb)
-    arrs = []
-    if res.multi_hand_landmarks:
-        for hlm in res.multi_hand_landmarks:
-            arrs.append(
-                np.array([[p.x, p.y, p.z] for p in hlm.landmark], dtype=np.float32)
-            )
-    normed = normalize_two_hands(arrs, max_hands=MAX_HANDS)
+    """
+    Deteksi tangan → normalisasi → padding ke MAX_HANDS → flatten.
+    Return shape: (FEATURES_PER_FRAME,).
+    """
+    landmarker = _get_landmarker()
+    hand_arrays = landmarker.detect_bgr(img_bgr)
+    normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)
     return flatten_frame(normed)
 
 

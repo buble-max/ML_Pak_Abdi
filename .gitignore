@@ -42,6 +42,7 @@ dataset/processed/
 *.keras
 *.tflite
 *.ckpt
+*.task
 checkpoints/
 logs/
 runs/

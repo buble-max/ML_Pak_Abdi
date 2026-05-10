@@ -1,25 +1,26 @@
 """
 Pembuatan dataset BISINDO secara manual langsung dari webcam laptop.
 
-Berbeda dari record_word_gestures.py yang menyimpan gambar frame mentah,
-script ini:
-  1. Menangkap frame real-time via OpenCV.
-  2. Mengekstraksi 21 landmark tangan menggunakan MediaPipe Hand Landmarker.
-  3. Menormalisasi landmark (wrist-centered + scale).
-  4. Memasukkan landmark ke dalam SequenceBuffer secara otomatis.
-  5. Saat buffer penuh (T frame), menyimpan sequence (T, F) beserta label
-     ke dalam file .npy yang siap training.
+Pipeline per frame:
+  1. OpenCV menangkap frame real-time dari webcam.
+  2. MediaPipe Tasks API (HandLandmarker, mode VIDEO) mengekstraksi
+     21 landmark tangan (x, y, z) per tangan.
+  3. Landmark dinormalisasi (wrist-centered + scale).
+  4. Masuk ke `SequenceBuffer` secara otomatis.
+  5. Saat buffer penuh (T frame), sequence (T, F) + label tersimpan ke
+     memori; buffer direset agar sample berikutnya bisa langsung direkam.
 
 Output disimpan di:
     dataset/processed/live/
         X_live.npy  shape (N, SEQUENCE_LENGTH, FEATURES_PER_FRAME)
         y_live.npy  shape (N,)
 
-File output bersifat APPEND: setiap kali script dijalankan, sample baru
-ditambahkan ke dataset yang sudah ada.
+Migrasi: sebelumnya menggunakan `mp.solutions.hands.Hands` yang sudah
+dihapus pada MediaPipe terbaru (Python 3.12). Sekarang menggunakan
+MediaPipe Tasks API (`HandLandmarker` + `hand_landmarker.task`).
 
-Mendukung SEMUA kelas (alfabet A-Z + 5 kata), sehingga pengguna dapat
-membuat dataset lengkap secara mandiri hanya dari kamera laptop.
+Mendukung SEMUA kelas (alfabet A-Z + 5 kata). Mode append: setiap kali
+script dijalankan, sample baru ditambahkan ke dataset yang sudah ada.
 
 Kontrol Keyboard:
     SPACE = mulai/stop perekaman sequence untuk label aktif
@@ -29,15 +30,6 @@ Kontrol Keyboard:
     d     = tampilkan statistik dataset saat ini
     r     = reset buffer (ulang sample terakhir)
     q     = simpan & keluar
-
-Workflow:
-    1. Jalankan:  python -m dataset.record_landmarks_live
-    2. Tekan n/p untuk memilih label.
-    3. Posisikan tangan di depan kamera.
-    4. Tekan SPACE untuk mulai merekam; buffer terisi otomatis.
-    5. Saat T frame terkumpul, sequence tersimpan dan buffer direset
-       sehingga sample berikutnya bisa langsung direkam (multi-sample).
-    6. Pindah label, ulangi. Tekan 's' atau 'q' untuk menyimpan ke .npy.
 """
 from __future__ import annotations
 
@@ -56,11 +48,12 @@ from config import (  # noqa: E402
     ALL_CLASSES,
     FEATURES_PER_FRAME,
     MAX_HANDS,
-    MP_MAX_NUM_HANDS,
-    MP_MIN_DETECTION_CONFIDENCE,
-    MP_MIN_TRACKING_CONFIDENCE,
     PROCESSED_DIR,
     SEQUENCE_LENGTH,
+)
+from preprocessing.mp_hand_landmarker import (  # noqa: E402
+    HandLandmarkerWrapper,
+    draw_hand_landmarks,
 )
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from preprocessing.sequence_builder import SequenceBuffer  # noqa: E402
@@ -115,32 +108,6 @@ def _print_stats(labels: List[int]) -> None:
         print(f"    {name:>14} : {counts[idx]:4d} sample")
     print(f"{'TOTAL':>18} : {len(labels):4d} sample")
     print("=" * 50 + "\n")
-
-
-def _extract_landmarks(
-    rgb_frame: np.ndarray, hands
-) -> Tuple[Optional[np.ndarray], object]:
-    """
-    Return (feature_vector, mp_result).
-    feature_vector: (FEATURES_PER_FRAME,) atau None jika tangan tidak terdeteksi.
-    mp_result     : hasil MediaPipe untuk kebutuhan drawing (menghindari
-                    proses dua kali pada frame yang sama).
-    """
-    res = hands.process(rgb_frame)
-    hand_arrays = []
-    if res.multi_hand_landmarks:
-        for hand_lms in res.multi_hand_landmarks:
-            arr = np.array(
-                [[p.x, p.y, p.z] for p in hand_lms.landmark],
-                dtype=np.float32,
-            )
-            hand_arrays.append(arr)
-
-    if not hand_arrays:
-        return None, res
-
-    normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)
-    return flatten_frame(normed), res
 
 
 def _draw_ui(
@@ -216,16 +183,8 @@ def _draw_ui(
 
 
 def main() -> None:
-    import mediapipe as mp
-
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=MP_MAX_NUM_HANDS,
-        min_detection_confidence=MP_MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=MP_MIN_TRACKING_CONFIDENCE,
-    )
-    mp_draw = mp.solutions.drawing_utils
-    mp_connections = mp.solutions.hands.HAND_CONNECTIONS
+    # MediaPipe Tasks API mode VIDEO (streaming webcam).
+    landmarker = HandLandmarkerWrapper(running_mode="video")
 
     sequences, labels = _load_existing()
     total_count = len(sequences)
@@ -235,16 +194,19 @@ def main() -> None:
     buf = SequenceBuffer()
     session_count = 0
     t_prev = time.time()
+    t_start = time.time()
     fps = 0.0
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[error] Webcam tidak dapat dibuka. Pastikan kamera tersedia.")
+        landmarker.close()
         return
 
     print("\n" + "=" * 60)
     print("  BISINDO LIVE DATASET RECORDER")
     print("  Rekam landmark langsung dari webcam -> .npy")
+    print("  Backend: MediaPipe Tasks API (HandLandmarker)")
     print("=" * 60)
     print(f"  Output          : {LIVE_DIR}")
     print(f"  Sequence length : {SEQUENCE_LENGTH} frame")
@@ -268,10 +230,13 @@ def main() -> None:
                 break
 
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ts_ms = int((time.time() - t_start) * 1000)
+            hand_arrays = landmarker.detect_bgr(frame, timestamp_ms=ts_ms)
+            hand_detected = bool(hand_arrays)
 
-            feat, mp_res = _extract_landmarks(rgb, hands)
-            hand_detected = feat is not None
+            # Buat vektor fitur (normalisasi + padding)
+            normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)
+            feat = flatten_frame(normed)
 
             if is_recording and hand_detected:
                 buf.push(feat)
@@ -288,10 +253,8 @@ def main() -> None:
                         f"{ALL_CLASSES[label_idx]} (session: {session_count})"
                     )
 
-            # Draw landmarks
-            if mp_res.multi_hand_landmarks:
-                for hand_lms in mp_res.multi_hand_landmarks:
-                    mp_draw.draw_landmarks(frame, hand_lms, mp_connections)
+            # Draw landmarks (helper manual, tanpa solutions.drawing_utils)
+            draw_hand_landmarks(frame, hand_arrays)
 
             # FPS (EMA)
             now = time.time()
@@ -351,7 +314,7 @@ def main() -> None:
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        hands.close()
+        landmarker.close()
         print("[done] Recorder selesai.")
 
 

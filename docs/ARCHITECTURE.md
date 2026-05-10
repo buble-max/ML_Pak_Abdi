@@ -61,6 +61,33 @@ augmentasi agar tetap nol.
 
 ## 3. Normalisasi
 
+### 3a. Ekstraksi Landmark via MediaPipe Tasks API
+
+Sejak MediaPipe versi terbaru (Python 3.12), API lama
+`mp.solutions.hands.Hands` dan `mp.solutions.drawing_utils` **sudah dihapus**
+dan memunculkan error:
+
+```
+AttributeError: module 'mediapipe' has no attribute 'solutions'
+```
+
+Seluruh pipeline preprocessing, real-time webcam, dan API sekarang
+menggunakan **MediaPipe Tasks API** (`mediapipe.tasks.python.vision.HandLandmarker`)
+via wrapper `preprocessing/mp_hand_landmarker.py`:
+
+| Konteks                        | Running mode | Fungsi                 |
+| ------------------------------ | ------------ | ---------------------- |
+| Preprocessing batch (gambar)   | `IMAGE`      | `landmarker.detect()`  |
+| Webcam real-time               | `VIDEO`      | `landmarker.detect_for_video(img, ts_ms)` |
+| API `/predict/frame` (REST)    | `IMAGE`      | `landmarker.detect()`  |
+
+Model asset `hand_landmarker.task` otomatis diunduh dari Google Cloud Storage
+ke `model/mp_assets/` pada penggunaan pertama. Drawing 21 titik + koneksi
+jari dilakukan lewat helper `draw_hand_landmarks()` (karena
+`mp.solutions.drawing_utils` juga tidak tersedia pada Tasks API).
+
+### 3b. Normalisasi Koordinat
+
 Invarian terhadap:
 - **Posisi tangan**: semua titik dikurangi `landmark[0]` (wrist).
 - **Ukuran tangan / jarak kamera**: dibagi `||landmark[9]||` (jarak

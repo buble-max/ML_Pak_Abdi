@@ -1,10 +1,12 @@
 """
-Pipeline preprocessing utama:
+Pipeline preprocessing utama.
 
 1. Membaca gambar statis dari `dataset/raw/<LABEL>/*.{jpg,png}` (alfabet)
    dan klip video dari `dataset/raw_words/<LABEL>/clip_*/frame_*.jpg` (kata).
 2. Mengekstraksi 21 landmark tangan (x, y, z) per frame menggunakan
-   MediaPipe Hand Landmarker (hingga MAX_HANDS tangan).
+   MediaPipe **Tasks API** (`HandLandmarker` + `hand_landmarker.task`),
+   menggantikan API lama `mp.solutions.hands.Hands` yang sudah dihapus
+   pada MediaPipe terbaru (Python 3.12).
 3. Menormalisasi landmark (lihat normalizer.normalize_two_hands).
 4. Mengubah gambar statis menjadi sequence temporal via SLIDING WINDOW
    (duplikasi frame + jitter kecil) atau langsung dari klip video.
@@ -28,9 +30,6 @@ from config import (  # noqa: E402
     ALPHABET_CLASSES,
     FEATURES_PER_FRAME,
     MAX_HANDS,
-    MP_MAX_NUM_HANDS,
-    MP_MIN_DETECTION_CONFIDENCE,
-    MP_MIN_TRACKING_CONFIDENCE,
     PROCESSED_DIR,
     RAW_DIR,
     SEQUENCE_LENGTH,
@@ -38,42 +37,29 @@ from config import (  # noqa: E402
     WORD_CLASSES,
     WORD_RAW_DIR,
 )
+from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper  # noqa: E402
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from utils.labels import build_label_maps, save_labels  # noqa: E402
 
-# MediaPipe diinisialisasi lazy supaya testing tanpa dependency lebih mudah
-_mp_hands = None
+
+def _get_landmarker(running_mode: str = "image") -> HandLandmarkerWrapper:
+    """Factory HandLandmarker (MediaPipe Tasks API)."""
+    return HandLandmarkerWrapper(running_mode=running_mode)
 
 
-def _get_hands(static: bool):
-    global _mp_hands
-    import mediapipe as mp
+def extract_landmarks_from_image(
+    image_bgr: np.ndarray,
+    landmarker: HandLandmarkerWrapper,
+) -> np.ndarray:
+    """
+    Ekstraksi 21 landmark per tangan (x, y, z) menggunakan MediaPipe
+    Tasks API, lalu normalisasi dan padding ke MAX_HANDS.
 
-    _mp_hands = mp.solutions.hands.Hands(
-        static_image_mode=static,
-        max_num_hands=MP_MAX_NUM_HANDS,
-        min_detection_confidence=MP_MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=MP_MIN_TRACKING_CONFIDENCE,
-    )
-    return _mp_hands
-
-
-def extract_landmarks_from_image(image_bgr: np.ndarray, hands) -> np.ndarray:
-    """Return shape (MAX_HANDS*21*3,) - normalized & flattened."""
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    res = hands.process(rgb)
-
-    hand_arrays: List[np.ndarray] = []
-    if res.multi_hand_landmarks:
-        for hand_lms in res.multi_hand_landmarks:
-            arr = np.array(
-                [[p.x, p.y, p.z] for p in hand_lms.landmark],
-                dtype=np.float32,
-            )  # (21, 3)
-            hand_arrays.append(arr)
-
-    normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)  # (MAX_HANDS,21,3)
-    return flatten_frame(normed)                                    # (FEATURES_PER_FRAME,)
+    Return shape: (FEATURES_PER_FRAME,) = (MAX_HANDS * 21 * 3,).
+    """
+    hand_arrays: List[np.ndarray] = landmarker.detect_bgr(image_bgr)
+    normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)   # (MAX_HANDS,21,3)
+    return flatten_frame(normed)                                     # (FEATURES_PER_FRAME,)
 
 
 # ---------------------------------------------------------------
@@ -81,7 +67,7 @@ def extract_landmarks_from_image(image_bgr: np.ndarray, hands) -> np.ndarray:
 # ---------------------------------------------------------------
 def static_images_to_sequences(
     image_paths: List[Path],
-    hands,
+    landmarker: HandLandmarkerWrapper,
     seq_len: int = SEQUENCE_LENGTH,
     stride: int = WINDOW_STRIDE,
 ) -> np.ndarray:
@@ -95,7 +81,7 @@ def static_images_to_sequences(
         img = cv2.imread(str(p))
         if img is None:
             continue
-        feats.append(extract_landmarks_from_image(img, hands))
+        feats.append(extract_landmarks_from_image(img, landmarker))
 
     if not feats:
         return np.zeros((0, seq_len, FEATURES_PER_FRAME), dtype=np.float32)
@@ -123,7 +109,9 @@ def static_images_to_sequences(
 # Klip video (gesture kata) → 1 sequence per klip
 # ---------------------------------------------------------------
 def clip_to_sequence(
-    clip_dir: Path, hands, seq_len: int = SEQUENCE_LENGTH
+    clip_dir: Path,
+    landmarker: HandLandmarkerWrapper,
+    seq_len: int = SEQUENCE_LENGTH,
 ) -> Optional[np.ndarray]:
     frames = sorted(clip_dir.glob("frame_*.jpg"))
     if not frames:
@@ -134,7 +122,7 @@ def clip_to_sequence(
         img = cv2.imread(str(f))
         if img is None:
             continue
-        feats.append(extract_landmarks_from_image(img, hands))
+        feats.append(extract_landmarks_from_image(img, landmarker))
     if not feats:
         return None
 
@@ -166,45 +154,50 @@ def build_dataset(
     y: List[int] = []
 
     # ---- ALFABET (gambar statis) ----
-    hands_static = _get_hands(static=True)
-    for label in ALPHABET_CLASSES:
-        class_dir = raw_dir / label
-        if not class_dir.exists():
-            print(f"[skip] {label}: folder tidak ditemukan")
-            continue
+    #  Tasks API mode IMAGE: cocok untuk preprocessing batch.
+    landmarker_static = _get_landmarker(running_mode="image")
+    try:
+        for label in ALPHABET_CLASSES:
+            class_dir = raw_dir / label
+            if not class_dir.exists():
+                print(f"[skip] {label}: folder tidak ditemukan")
+                continue
 
-        imgs = sorted(
-            [p for p in class_dir.iterdir()
-             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
-        )
-        if not imgs:
-            print(f"[skip] {label}: kosong")
-            continue
+            imgs = sorted(
+                [p for p in class_dir.iterdir()
+                 if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
+            )
+            if not imgs:
+                print(f"[skip] {label}: kosong")
+                continue
 
-        seqs = static_images_to_sequences(imgs, hands_static)
-        X.append(seqs)
-        y.extend([label_to_idx[label]] * seqs.shape[0])
-        print(f"  {label:>3}: {len(imgs):4d} img → {seqs.shape[0]:4d} seq")
-
-    # ---- KATA (klip video) ----
-    hands_video = _get_hands(static=False)
-    for label in WORD_CLASSES:
-        class_dir = word_dir / label
-        if not class_dir.exists():
-            print(f"[skip] {label}: folder tidak ditemukan")
-            continue
-
-        clips = sorted([d for d in class_dir.iterdir() if d.is_dir()])
-        class_seqs = []
-        for clip in tqdm(clips, desc=f"  {label}", leave=False):
-            seq = clip_to_sequence(clip, hands_video)
-            if seq is not None:
-                class_seqs.append(seq)
-        if class_seqs:
-            seqs = np.stack(class_seqs, axis=0)  # (N, T, F)
+            seqs = static_images_to_sequences(imgs, landmarker_static)
             X.append(seqs)
             y.extend([label_to_idx[label]] * seqs.shape[0])
-            print(f"  {label:>12}: {len(clips):4d} clip → {seqs.shape[0]:4d} seq")
+            print(f"  {label:>3}: {len(imgs):4d} img → {seqs.shape[0]:4d} seq")
+
+        # ---- KATA (klip video) ----
+        #  Kita tetap gunakan mode IMAGE karena frame dari klip diproses
+        #  satu per satu sebagai still image, bukan stream.
+        for label in WORD_CLASSES:
+            class_dir = word_dir / label
+            if not class_dir.exists():
+                print(f"[skip] {label}: folder tidak ditemukan")
+                continue
+
+            clips = sorted([d for d in class_dir.iterdir() if d.is_dir()])
+            class_seqs = []
+            for clip in tqdm(clips, desc=f"  {label}", leave=False):
+                seq = clip_to_sequence(clip, landmarker_static)
+                if seq is not None:
+                    class_seqs.append(seq)
+            if class_seqs:
+                seqs = np.stack(class_seqs, axis=0)  # (N, T, F)
+                X.append(seqs)
+                y.extend([label_to_idx[label]] * seqs.shape[0])
+                print(f"  {label:>12}: {len(clips):4d} clip → {seqs.shape[0]:4d} seq")
+    finally:
+        landmarker_static.close()
 
     # ---- LIVE (dataset manual dari webcam → .npy) ----
     live_dir = out_dir / "live"

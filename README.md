@@ -55,7 +55,14 @@ Tiga sumber dataset yang didukung sistem:
    karakteristik tangan pengguna persis sama dengan saat inference.
 
 ### 2. Preprocessing
-- Ekstraksi **21 landmark tangan** (x, y, z) menggunakan MediaPipe Hand Landmarker.
+- Ekstraksi **21 landmark tangan** (x, y, z) menggunakan **MediaPipe Tasks API**
+  (`HandLandmarker` + `hand_landmarker.task`). API lama `mp.solutions.hands`
+  sudah dihapus pada MediaPipe terbaru (Python 3.12); pipeline kami
+  menggunakan `HandLandmarker.detect()` (mode IMAGE) dan
+  `HandLandmarker.detect_for_video()` (mode VIDEO) — lihat
+  `preprocessing/mp_hand_landmarker.py`.
+- Model asset `hand_landmarker.task` diunduh otomatis ke `model/mp_assets/`
+  saat pertama kali dibutuhkan.
 - **Normalisasi** terhadap wrist (titik 0) dan jarak wrist↔middle-MCP untuk
   menghilangkan pengaruh posisi, ukuran tangan, dan jarak kamera.
 - Konversi gambar statis → sequence temporal dengan **sliding window** (default T=30).

@@ -78,19 +78,19 @@ def demo_frame_session() -> None:
 
 
 async def demo_ws_landmarks() -> None:
-    """Streaming landmark real-time via WebSocket."""
+    """Streaming landmark real-time via WebSocket (MediaPipe Tasks API)."""
+    import time
+
     import cv2
-    import mediapipe as mp
     import websockets
 
+    from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper
     from preprocessing.normalizer import flatten_frame, normalize_two_hands
 
     uri = f"ws://{API_HOST if API_HOST != '0.0.0.0' else 'localhost'}:{API_PORT}/ws/realtime"
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=False, max_num_hands=2,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
-    )
+    landmarker = HandLandmarkerWrapper(running_mode="video")
     cap = cv2.VideoCapture(0)
+    t_start = time.time()
 
     async with websockets.connect(uri) as ws:
         try:
@@ -98,21 +98,18 @@ async def demo_ws_landmarks() -> None:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = hands.process(rgb)
-                arrs = []
-                if res.multi_hand_landmarks:
-                    for h in res.multi_hand_landmarks:
-                        arrs.append(np.array(
-                            [[p.x, p.y, p.z] for p in h.landmark], dtype=np.float32
-                        ))
-                feat = flatten_frame(normalize_two_hands(arrs, max_hands=2))
+                ts_ms = int((time.time() - t_start) * 1000)
+                hand_arrays = landmarker.detect_bgr(frame, timestamp_ms=ts_ms)
+                feat = flatten_frame(
+                    normalize_two_hands(hand_arrays, max_hands=2)
+                )
                 await ws.send(json.dumps({"type": "landmarks", "frame": feat.tolist()}))
                 resp = json.loads(await ws.recv())
                 if resp.get("type") == "prediction":
                     print(f"label={resp['label']:<12} conf={resp['confidence']:.2f}")
         finally:
             cap.release()
+            landmarker.close()
 
 
 if __name__ == "__main__":
