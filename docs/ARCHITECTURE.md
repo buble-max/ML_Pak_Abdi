@@ -5,7 +5,7 @@ Dokumentasi teknis lengkap pipeline, format data, dan keputusan desain.
 ## 1. Alur Data End-to-End
 
 ```
-Dataset Mentah (gambar / klip video)
+Dataset Mentah (gambar / klip video / landmark live .npy)
         │
         ▼
 MediaPipe Hand Landmarker  ──►  21 titik (x,y,z) per tangan
@@ -19,7 +19,9 @@ Padding hingga 2 tangan  ──►  (42, 3) per frame  ──►  flatten 126-di
         ▼
 ┌── Static (alfabet) ──► Sliding window stride 5, T=30 ──┐
 │                                                        │
-└── Klip video (kata)  ─► Uniform resample ke T=30 ──────┘
+├── Klip video (kata)  ─► Uniform resample ke T=30 ──────┤
+│                                                        │
+└── Landmark live .npy ─► SequenceBuffer di webcam ──────┘
                                                          ▼
                                X.npy (N, 30, 126) + y.npy (N,)
                                                          │
@@ -77,6 +79,31 @@ Dataset BISINDO sumber berupa gambar statis. Kita:
 
 Hasil: satu kelas alfabet menghasilkan banyak sequence "pseudo-temporal"
 yang dapat dipelajari LSTM.
+
+### 4b. Dataset Live (langsung dari webcam → .npy)
+
+Sumber dataset ketiga: pengguna merekam landmark langsung dari kamera
+laptop via `dataset/record_landmarks_live.py`. Alurnya:
+
+1. OpenCV menangkap frame real-time dari webcam.
+2. Setiap frame diproses MediaPipe → 21 landmark (x, y, z) per tangan.
+3. Landmark dinormalisasi (sama persis dengan pipeline static/video).
+4. Hasil flatten dimasukkan ke `SequenceBuffer` berukuran T=30.
+5. Saat buffer penuh, sequence (T, F) otomatis disimpan ke memori;
+   buffer direset sehingga sample berikutnya bisa direkam segera
+   (multi-sample per sesi tanpa jeda).
+6. Saat user menekan `s`/`q`, seluruh data ditulis ke
+   `dataset/processed/live/{X_live.npy, y_live.npy}` (append mode).
+
+Keuntungan:
+- Kondisi data (pencahayaan, sudut kamera, karakteristik tangan user)
+  identik dengan saat inference → generalisasi real-time lebih baik.
+- Tidak butuh dataset eksternal tambahan untuk menambah variasi.
+- Mendukung SEMUA kelas (alfabet A-Z + 5 kata) dalam satu script.
+
+`preprocessing.landmark_extractor.build_dataset()` otomatis menggabungkan
+`X_live.npy` ke dalam `X.npy` master saat tersedia, sehingga alur
+augment → train tidak perlu dimodifikasi.
 
 ## 5. Augmentation
 

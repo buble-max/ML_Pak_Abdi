@@ -206,8 +206,23 @@ def build_dataset(
             y.extend([label_to_idx[label]] * seqs.shape[0])
             print(f"  {label:>12}: {len(clips):4d} clip → {seqs.shape[0]:4d} seq")
 
+    # ---- LIVE (dataset manual dari webcam → .npy) ----
+    live_dir = out_dir / "live"
+    x_live_path = live_dir / "X_live.npy"
+    y_live_path = live_dir / "y_live.npy"
+    if x_live_path.exists() and y_live_path.exists():
+        X_live = np.load(x_live_path)
+        y_live = np.load(y_live_path)
+        if X_live.shape[1:] == (SEQUENCE_LENGTH, FEATURES_PER_FRAME):
+            X.append(X_live)
+            y.extend(y_live.tolist())
+            print(f"  {'LIVE':>12}: {X_live.shape[0]:4d} seq (dari webcam recorder)")
+        else:
+            print(f"[warn] X_live shape {X_live.shape} tidak kompatibel, dilewati.")
+
     if not X:
-        print("[error] Tidak ada data terbangun. Cek dataset/raw dan dataset/raw_words.")
+        print("[error] Tidak ada data terbangun. Cek dataset/raw, dataset/raw_words,")
+        print("        atau jalankan: python -m dataset.record_landmarks_live")
         return
 
     X_arr = np.concatenate(X, axis=0).astype(np.float32)
