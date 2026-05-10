@@ -41,8 +41,10 @@ Webcam ─► OpenCV ─► MediaPipe Hand Landmarker ─► Normalisasi Landmar
 ### 1. Dataset
 Tiga sumber dataset yang didukung sistem:
 1. **Gambar statis BISINDO** (alfabet A–Z) — diunduh otomatis dari repository
-   [Indonesian Sign Language BISINDO Hand Sign Detection Dataset](https://github.com/)
-   via `dataset/download_dataset.py`.
+   [Indonesian Sign Language BISINDO Hand Sign Detection Dataset](https://github.com/rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset)
+   via `dataset/download_dataset.py`. Dataset tidak tersedia sebagai `.zip`
+   terpisah sehingga script akan melakukan `git clone` repo penuh lalu
+   mengambil folder `collectedimages/` sebagai sumber utama.
 2. **Klip video gesture kata** — direkam mandiri dari webcam (frame gambar)
    via `dataset/record_word_gestures.py`.
 3. **Landmark langsung dari webcam** — dataset manual yang ditangkap real-time

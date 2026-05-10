@@ -70,7 +70,13 @@ Invarian terhadap:
 
 ## 4. Sliding Window (static images)
 
-Dataset BISINDO sumber berupa gambar statis. Kita:
+Dataset BISINDO sumber berupa gambar statis yang berasal dari folder
+`collectedimages/` pada repo
+[rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset](https://github.com/rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset).
+Karena dataset tidak disediakan dalam arsip `.zip`, pengambilan dilakukan
+dengan `git clone` repo penuh lalu menyalin subfolder per-label dari
+`collectedimages/<LABEL>/` ke `dataset/raw/<LABEL>/`. Setelah itu:
+
 1. Ekstrak vektor landmark untuk setiap gambar.
 2. Susun vektor-vektor tersebut berurutan (per kelas) menjadi array (M, 126).
 3. Jika `M < T`, replikasi + tambahkan jitter halus (σ=1e-3) agar tetap
