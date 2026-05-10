@@ -1,14 +1,24 @@
 """
-Mengunduh dataset BISINDO (Indonesian Sign Language Hand Sign Detection Dataset).
+Mengunduh dataset BISINDO (Indonesian Sign Language BISINDO Hand Sign Detection
+Dataset) dari repository GitHub:
 
-Dataset diharapkan tersusun dalam struktur:
-    dataset/raw/<LABEL>/<image>.jpg
+    https://github.com/rhiosutoyo/
+        Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset
 
-Script ini mencoba beberapa strategi:
-1. `git clone` repository sumber (fast path).
-2. Fallback: download ZIP archive.
-3. Jika struktur sumber berbeda, script akan memindai subfolder per huruf/label
-   (A..Z) lalu menyalinnya ke layout standar di `dataset/raw/`.
+Dataset TIDAK disediakan sebagai arsip .zip, melainkan langsung tersusun
+sebagai folder di `collectedimages/` pada branch `master`. Setiap subfolder
+merepresentasikan label gesture (umumnya huruf alfabet BISINDO A-Z) dan
+berisi file gambar .jpg / .png.
+
+Strategi pengambilan:
+1. `git clone` repository secara penuh (shallow depth=1 untuk efisiensi).
+   Jika tidak bisa clone, fallback download ZIP branch master.
+2. Ambil folder `collectedimages/` sebagai sumber dataset utama.
+3. Salin setiap subfolder label ke layout standar proyek:
+       dataset/raw/<LABEL>/<image>.jpg
+
+Setelah tahap ini, `preprocessing/landmark_extractor.py` dapat memproses
+`dataset/raw/` seperti biasa (MediaPipe → normalisasi → sliding window → .npy).
 """
 from __future__ import annotations
 
@@ -23,22 +33,41 @@ from urllib.request import urlretrieve
 # Supaya bisa dijalankan langsung: `python dataset/download_dataset.py`
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from config import ALPHABET_CLASSES, BISINDO_REPO_URL, RAW_DIR  # noqa: E402
+from config import (  # noqa: E402
+    ALPHABET_CLASSES,
+    BISINDO_DATASET_SUBDIR,
+    BISINDO_REPO_BRANCH,
+    BISINDO_REPO_URL,
+    RAW_DIR,
+)
 
 
-def _git_clone(url: str, dest: Path) -> bool:
+def _git_clone(url: str, dest: Path, branch: str) -> bool:
     if dest.exists():
         shutil.rmtree(dest)
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
+            [
+                "git", "clone",
+                "--depth", "1",
+                "--branch", branch,
+                url, str(dest),
+            ],
             check=True,
             capture_output=True,
         )
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"[warn] git clone gagal: {e}")
-        return False
+        # fallback tanpa --branch (mis. kalau nama branch default berbeda)
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", url, str(dest)],
+                check=True, capture_output=True,
+            )
+            return True
+        except Exception:
+            print(f"[warn] git clone gagal: {e}")
+            return False
 
 
 def _download_zip(url: str, dest_zip: Path) -> bool:
@@ -50,37 +79,64 @@ def _download_zip(url: str, dest_zip: Path) -> bool:
         return False
 
 
-def _flatten_to_raw(source_root: Path, raw_dir: Path) -> int:
+def _copy_dataset_from_subdir(
+    source_root: Path,
+    raw_dir: Path,
+    subdir: str = BISINDO_DATASET_SUBDIR,
+) -> int:
     """
-    Pindai `source_root` secara rekursif. Jika menemukan folder dengan nama
-    satu karakter alfabet (A-Z), salin isinya ke `raw_dir/<LABEL>/`.
+    Ambil folder `<source_root>/**/<subdir>` (mis. `collectedimages/`) sebagai
+    sumber dataset. Salin setiap subfolder label ke `raw_dir/<LABEL>/`.
+
+    Label dinormalisasi menjadi uppercase. Jika label tidak termasuk alfabet
+    A-Z, folder tetap disalin (mendukung label tambahan di masa depan).
     """
+    # Cari folder `collectedimages` di mana pun di dalam tree (repo ZIP sering
+    # ter-ekstrak di bawah folder bernama `<repo>-<branch>/`).
+    candidates = [p for p in source_root.rglob(subdir) if p.is_dir()]
+    if not candidates:
+        print(f"[error] Folder '{subdir}/' tidak ditemukan di {source_root}")
+        return 0
+
+    src = candidates[0]
+    print(f"[info] Menggunakan sumber dataset: {src}")
+
     count = 0
-    for subdir in source_root.rglob("*"):
-        if not subdir.is_dir():
+    for label_dir in sorted(src.iterdir()):
+        if not label_dir.is_dir():
             continue
-        name = subdir.name.strip().upper()
-        if name in ALPHABET_CLASSES:
-            target = raw_dir / name
-            target.mkdir(parents=True, exist_ok=True)
-            for img in subdir.iterdir():
-                if img.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-                    shutil.copy2(img, target / img.name)
-                    count += 1
+        label = label_dir.name.strip().upper()
+        target = raw_dir / label
+        target.mkdir(parents=True, exist_ok=True)
+
+        for img in label_dir.iterdir():
+            if img.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
+                shutil.copy2(img, target / img.name)
+                count += 1
     return count
 
 
-def download_bisindo(repo_url: Optional[str] = None, raw_dir: Path = RAW_DIR) -> None:
+def download_bisindo(
+    repo_url: Optional[str] = None,
+    branch: str = BISINDO_REPO_BRANCH,
+    subdir: str = BISINDO_DATASET_SUBDIR,
+    raw_dir: Path = RAW_DIR,
+) -> None:
     repo_url = repo_url or BISINDO_REPO_URL
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = raw_dir.parent / "_tmp_bisindo"
-    print(f"[info] Mengunduh dataset BISINDO dari: {repo_url}")
+    print(f"[info] Mengunduh dataset BISINDO dari: {repo_url} (branch={branch})")
+    print(f"[info] Sumber dataset: {subdir}/")
 
-    ok = _git_clone(repo_url, tmp_dir)
+    # --- 1. Coba git clone ---
+    ok = _git_clone(repo_url, tmp_dir, branch)
+
+    # --- 2. Fallback: download ZIP ---
     if not ok:
-        zip_url = repo_url.rstrip("/") + "/archive/refs/heads/main.zip"
+        zip_url = repo_url.rstrip("/") + f"/archive/refs/heads/{branch}.zip"
         zip_path = raw_dir.parent / "_bisindo.zip"
+        print(f"[info] Mencoba fallback ZIP: {zip_url}")
         if _download_zip(zip_url, zip_path):
             with zipfile.ZipFile(zip_path) as zf:
                 zf.extractall(tmp_dir)
@@ -88,21 +144,28 @@ def download_bisindo(repo_url: Optional[str] = None, raw_dir: Path = RAW_DIR) ->
         else:
             print(
                 "[error] Tidak dapat mengunduh dataset secara otomatis.\n"
-                "        Silakan clone manual ke folder dataset/raw/<LABEL>/."
+                f"        Silakan clone manual ke {tmp_dir}, atau salin\n"
+                f"        folder {subdir}/<LABEL>/ ke dataset/raw/<LABEL>/."
             )
             return
 
-    copied = _flatten_to_raw(tmp_dir, raw_dir)
+    # --- 3. Salin dari collectedimages/ ke dataset/raw/ ---
+    copied = _copy_dataset_from_subdir(tmp_dir, raw_dir, subdir=subdir)
     print(f"[info] Disalin {copied} gambar ke {raw_dir}")
 
-    # Bersihkan
+    # Bersihkan working copy
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Ringkasan
-    for c in ALPHABET_CLASSES:
-        d = raw_dir / c
-        n = len(list(d.glob("*"))) if d.exists() else 0
-        print(f"  {c}: {n} gambar")
+    # --- 4. Ringkasan per kelas ---
+    print("\n[summary] Jumlah gambar per kelas:")
+    for label_dir in sorted(raw_dir.iterdir()):
+        if label_dir.is_dir():
+            n = sum(
+                1 for p in label_dir.iterdir()
+                if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+            )
+            marker = "   " if label_dir.name in ALPHABET_CLASSES else "  +"
+            print(f"  {marker} {label_dir.name:>10}: {n} gambar")
 
 
 if __name__ == "__main__":

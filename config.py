@@ -24,10 +24,14 @@ LABELS_PATH = MODEL_DIR / "labels.json"
 # ============================================================
 # DATASET
 # ============================================================
-# Repository sumber dataset BISINDO
+# Repository sumber dataset BISINDO (Indonesian Sign Language Hand Sign
+# Detection Dataset). Struktur: collectedimages/<LABEL>/*.jpg
 BISINDO_REPO_URL = (
-    "https://github.com/ardamavi/Indonesian-Sign-Language-Hand-Sign-Detection"
+    "https://github.com/rhiosutoyo/"
+    "Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset"
 )
+BISINDO_REPO_BRANCH = "master"
+BISINDO_DATASET_SUBDIR = "collectedimages"
 
 # Kelas alfabet BISINDO (A–Z)
 ALPHABET_CLASSES = [chr(c) for c in range(ord("A"), ord("Z") + 1)]

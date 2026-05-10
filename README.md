@@ -39,10 +39,20 @@ Webcam ─► OpenCV ─► MediaPipe Hand Landmarker ─► Normalisasi Landmar
 ## Pipeline
 
 ### 1. Dataset
-Dataset utama berasal dari repository
-[Indonesian Sign Language BISINDO Hand Sign Detection Dataset](https://github.com/).
-Gambar statis alfabet A–Z ditambah 5 gesture kata yang direkam mandiri
-(`dataset/record_word_gestures.py`).
+Tiga sumber dataset yang didukung sistem:
+1. **Gambar statis BISINDO** (alfabet A–Z) — diunduh otomatis dari repository
+   [Indonesian Sign Language BISINDO Hand Sign Detection Dataset](https://github.com/rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset)
+   via `dataset/download_dataset.py`. Dataset tidak tersedia sebagai `.zip`
+   terpisah sehingga script akan melakukan `git clone` repo penuh lalu
+   mengambil folder `collectedimages/` sebagai sumber utama.
+2. **Klip video gesture kata** — direkam mandiri dari webcam (frame gambar)
+   via `dataset/record_word_gestures.py`.
+3. **Landmark langsung dari webcam** — dataset manual yang ditangkap real-time
+   dari kamera laptop, diproses MediaPipe + normalisasi + sequence buffer,
+   lalu disimpan langsung sebagai `.npy` via
+   `dataset/record_landmarks_live.py`. Pendekatan ini menghasilkan dataset
+   yang paling realistis karena kondisi pencahayaan, sudut kamera, dan
+   karakteristik tangan pengguna persis sama dengan saat inference.
 
 ### 2. Preprocessing
 - Ekstraksi **21 landmark tangan** (x, y, z) menggunakan MediaPipe Hand Landmarker.
@@ -98,7 +108,12 @@ python dataset/download_dataset.py
 # 3. Rekam gesture kata tambahan (opsional, jika dataset belum ada)
 python dataset/record_word_gestures.py
 
+# 3b. ATAU buat dataset mandiri langsung dari webcam (landmark → .npy)
+#     Mendukung semua kelas (alfabet + kata), append mode.
+python -m dataset.record_landmarks_live
+
 # 4. Preprocessing (ekstraksi landmark + sliding window → .npy)
+#    Akan otomatis menggabungkan data live dari langkah 3b.
 python -m preprocessing.landmark_extractor
 
 # 5. Training (lokal / Colab)
