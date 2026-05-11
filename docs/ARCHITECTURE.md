@@ -8,40 +8,50 @@ kriteria evaluasi sistem.
 ## 1. Alur Data End-to-End
 
 ```
-Dataset Mentah (gambar / klip video / landmark live .npy)
+Sumber Dataset:
+  - Gambar statis      : dataset/raw/<LABEL>/*.jpg
+  - Klip frame folder  : dataset/raw_words/<LABEL>/clip_*/frame_*.jpg
+  - Video utuh         : dataset/raw_videos/<LABEL>/*.mp4|.avi|.mov|...
+  - Live recorder      : dataset/processed/live/{X_live,y_live}.npy
         │
         ▼
-MediaPipe Tasks API (HandLandmarker)  ──►  21 titik (x,y,z) per tangan
+Video Ingestion (OpenCV VideoCapture)
+  - probe_video -> frame_count, fps, (w, h)
+  - temporal sampling: uniform | stride | random | adaptive
         │
         ▼
-Normalisasi  (wrist-centered + scale(wrist ↔ middle_MCP))
+MediaPipe Tasks API (HandLandmarker)  -> 21 titik (x, y, z) per tangan
         │
         ▼
-Padding hingga 2 tangan  ──►  (42, 3) per frame  ──►  flatten 126-dim
+Normalisasi (wrist-centered + scale via wrist <-> middle_MCP)
         │
         ▼
-┌── Static (alfabet+angka) ──► Sliding window (configurable) ──┐
-│                                                              │
-├── Klip video (kata+angka) ─► Temporal sampling (uniform/rng) ┤
-│                                                              │
-└── Landmark live .npy ──────► SequenceBuffer webcam ──────────┘
-                                                         ▼
-                               X.npy (N, T, 126) + y.npy (N,)
-                                                         │
-                                                         ▼
-                Augment (spatial + temporal jitter) + Class balancing
-                                                         │
-                                                         ▼
-                        Train/Val/Test stratified (configurable ratio)
-                                                         │
-                                                         ▼
-                    CNN+LSTM (TimeDistributed → LSTM → Dense)
-                                                         │
-                                                         ▼
-                                bisindo_model.h5
-                                                         │
-                                                         ▼
-                   Real-time inference (webcam) / API (FastAPI)
+Padding 2 tangan (42, 3) per frame -> flatten 126-dim
+        │
+        ▼
+Temporal Resampler (interpolate / pad_last / pad_zero / trim_*)
+  -> sequence panjang tetap (T, F)
+        │
+        ▼
+X.npy (N, T, F) + y.npy (N,)
+        │
+        ▼
+Augment:
+  Temporal  : speed, jitter, frame drop, motion noise, reverse, shift
+  Spatial   : noise, scale, rotate 3D, translate
+  Balancing : oversample kelas minoritas
+        │
+        ▼
+Train/Val/Test split (rasio configurable: 70/15/15, 30/70, ...)
+        │
+        ▼
+CNN + LSTM (TimeDistributed -> LSTM -> Dense)
+        │
+        ▼
+bisindo_model.h5
+        │
+        ▼
+Real-time inference (webcam) / API (FastAPI) / Video file inference
 ```
 
 ---
@@ -99,20 +109,66 @@ Model `hand_landmarker.task` auto-download ke `model/mp_assets/`.
 
 Semua parameter berada di `config.py` dan dapat diubah fleksibel:
 
-| Parameter            | Default   | Deskripsi                                     |
-| -------------------- | --------- | --------------------------------------------- |
-| `SEQUENCE_LENGTH`    | 30        | Jumlah frame per sample (T)                   |
-| `WINDOW_STRIDE`      | 5         | Hop antar sliding window                      |
-| `SEQUENCE_OVERLAP`   | 0.83      | Overlap ratio (menggantikan WINDOW_STRIDE jika > 0) |
-| `FRAME_STRIDE`       | 1         | Interval pengambilan frame (1=semua, 2=skip 1, dst) |
-| `TEMPORAL_SAMPLING`  | "uniform" | Metode sampling klip video ("uniform" / "random") |
-| `VAL_SPLIT`          | 0.15      | Rasio validasi                                |
-| `TEST_SPLIT`         | 0.15      | Rasio test                                    |
+| Parameter            | Default       | Deskripsi                                         |
+| -------------------- | ------------- | ------------------------------------------------- |
+| `SEQUENCE_LENGTH`    | 30            | Jumlah frame per sample (T)                       |
+| `WINDOW_STRIDE`      | 5             | Hop antar sliding window                          |
+| `SEQUENCE_OVERLAP`   | 0.83          | Overlap ratio (menggantikan WINDOW_STRIDE jika > 0) |
+| `FRAME_STRIDE`       | 1             | Interval pengambilan frame (1=semua, 2=skip 1, dst) |
+| `TEMPORAL_SAMPLING`  | "uniform"     | "uniform" / "stride" / "random" / "adaptive"      |
+| `TEMPORAL_PADDING`   | "interpolate" | "interpolate" / "pad_last" / "pad_zero"           |
+| `VIDEO_SLIDING_WINDOW` | False       | True = video panjang -> banyak sequence per video |
+| `VAL_SPLIT`          | 0.15          | Rasio validasi                                    |
+| `TEST_SPLIT`         | 0.15          | Rasio test                                        |
 
 **Contoh konfigurasi rasio**:
 - 70/15/15: `VAL_SPLIT=0.15, TEST_SPLIT=0.15` (default)
 - 80/10/10: `VAL_SPLIT=0.10, TEST_SPLIT=0.10`
 - 30/70 (no test): `VAL_SPLIT=0.70, TEST_SPLIT=0.0`
+
+---
+
+## 5b. Video-Based Temporal Training Pipeline
+
+Sejak upgrade ini, pipeline tidak lagi hanya mengandalkan gambar statis
+atau folder klip frame — sistem dapat memproses **file video utuh** sebagai
+satu sequence temporal asli.
+
+### Video Ingestion (`preprocessing/video_ingestion.py`)
+- `probe_video(path)` — baca `frame_count`, `fps`, dimensi.
+- `iter_video_frames(path)` — streaming frame tanpa memuat seluruh video.
+- `read_video_frames(path, ...)` — decode + pilih frame berdasarkan
+  `TEMPORAL_SAMPLING`:
+  - **uniform**: `np.linspace(0, N-1, T)`
+  - **stride**: ambil tiap frame ke-`FRAME_STRIDE`, lalu uniform di atasnya
+  - **random**: pilih T frame acak (sorted)
+  - **adaptive**: stride dulu untuk mengurangi redundansi → uniform
+
+### Temporal Resampler (`preprocessing/temporal_resampler.py`)
+- `interpolate_to_length(arr, T)` — linear interpolation antar frame.
+- `pad_sequence(arr, T, mode)` — pad_last / pad_zero.
+- `trim_sequence(arr, T, mode)` — trim_center / trim_start / trim_end.
+- `resample_to_fixed_length(...)` — high-level: kombinasi interpolate +
+  padding + trimming untuk menghasilkan shape `(T, F)` yang konsisten.
+
+### Dua Strategi Video -> Training Sample
+1. **1 video = 1 sample** (default, `VIDEO_SLIDING_WINDOW=False`):
+   seluruh video di-sample `T` frame lalu di-resample ke `(T, F)`.
+2. **Sliding window** (`VIDEO_SLIDING_WINDOW=True`): decode semua frame
+   (dengan `FRAME_STRIDE`), lalu sliding window di ruang landmark dengan
+   `SEQUENCE_OVERLAP` / `WINDOW_STRIDE`. Cocok untuk gesture kalimat
+   panjang yang mengandung beberapa token gesture.
+
+### Webcam Video Recorder (`dataset/record_video_gestures.py`)
+Merekam gesture langsung sebagai video `.mp4` **dan** menghasilkan
+landmark sequence `.npy` secara simultan. Video tersimpan ke
+`dataset/raw_videos/<LABEL>/clip_XXXX.mp4` dan landmark langsung masuk
+ke `dataset/processed/live/{X_live,y_live}.npy` — siap pakai training
+tanpa preprocessing tambahan.
+
+### Video File Inference
+- CLI: `python -m inference.video_inference path/to/video.mp4 [--sliding]`
+- API: `POST /predict/video` (multipart `file=...`, opsional `sliding=true`).
 
 ---
 
@@ -139,17 +195,31 @@ Semua parameter berada di `config.py` dan dapat diubah fleksibel:
 
 ## 7. Augmentasi Temporal & Spasial
 
-| Teknik            | Parameter            | Deskripsi                                  |
-| ----------------- | -------------------- | ------------------------------------------ |
-| Temporal jitter   | `AUG_TEMPORAL_JITTER=2` | Shift frame ±N posisi (clamp [0,T-1])  |
-| Gaussian noise    | `AUG_NOISE_STD=0.01`   | Noise pada koordinat landmark            |
-| Scaling           | `AUG_SCALE_RANGE=(0.9,1.1)` | Zoom seragam                       |
-| Rotasi 3D         | `AUG_ROTATION_DEG=15` | ±15° (z), ±7.5° (x,y)                    |
-| Translasi         | `AUG_TRANSLATION=0.05` | Shift posisi tangan                      |
-| Class balancing   | automatic             | Oversample kelas minoritas via augment   |
+Urutan augment: **temporal dulu -> baru spatial**.
 
-Temporal jitter diterapkan **sebelum** spatial augmentation untuk
-mensimulasikan variasi kecepatan gesture antar pengguna.
+### Temporal (`augmentation/temporal_augment.py`)
+
+| Teknik               | Parameter                   | Deskripsi                                    |
+| -------------------- | --------------------------- | -------------------------------------------- |
+| Speed variation      | `AUG_SPEED_RANGE=(0.8,1.2)` | Resample dengan faktor kecepatan acak        |
+| Temporal jitter      | `AUG_TEMPORAL_JITTER=2`     | Shift frame ±N (clamp)                       |
+| Random frame drop    | `AUG_FRAME_DROP_PROB=0.05`  | Drop frame acak lalu interpolate kembali ke T|
+| Motion noise         | `AUG_MOTION_NOISE_STD=0.003`| Smooth random-walk drift antar frame         |
+| Sequence reverse     | `AUG_REVERSE_PROB=0.0`      | Balik urutan (default disabled, gesture asimetris) |
+| Temporal shift       | `AUG_TEMPORAL_SHIFT=3`      | Circular shift ±N frame                      |
+
+### Spatial
+
+| Teknik            | Parameter                    | Deskripsi                                  |
+| ----------------- | ---------------------------- | ------------------------------------------ |
+| Gaussian noise    | `AUG_NOISE_STD=0.01`         | Noise pada koordinat landmark              |
+| Scaling           | `AUG_SCALE_RANGE=(0.9,1.1)`  | Zoom seragam                               |
+| Rotasi 3D         | `AUG_ROTATION_DEG=15`        | ±15° (z), ±7.5° (x,y)                      |
+| Translasi         | `AUG_TRANSLATION=0.05`       | Shift posisi tangan                        |
+| Class balancing   | automatic                    | Oversample kelas minoritas via augment     |
+
+Semua augment mempertahankan padding nol (tangan hilang) kecuali motion
+noise yang hanya diterapkan pada tangan valid.
 
 ---
 
@@ -214,12 +284,13 @@ Default: `BUFFER_SIZE=10`, `SMOOTHING_MIN_VOTES=6`, `CONFIDENCE_THRESHOLD=0.70`,
 
 ### REST Endpoints
 
-| Method | Endpoint             | Input                          | Output           |
-| ------ | -------------------- | ------------------------------ | ---------------- |
-| GET    | `/health`            | -                              | status + model info |
-| GET    | `/labels`            | -                              | list of classes  |
-| POST   | `/predict/landmarks` | sequence (T×F floats)          | PredictionResponse |
-| POST   | `/predict/frame`     | session_id + base64 image      | PredictionResponse |
+| Method | Endpoint             | Input                                    | Output                 |
+| ------ | -------------------- | ---------------------------------------- | ---------------------- |
+| GET    | `/health`            | -                                        | status + model info    |
+| GET    | `/labels`            | -                                        | list of classes        |
+| POST   | `/predict/landmarks` | sequence (T×F floats)                    | PredictionResponse     |
+| POST   | `/predict/frame`     | session_id + base64 image                | PredictionResponse     |
+| POST   | `/predict/video`     | multipart file + opsional `sliding=true` | VideoPredictResponse   |
 
 ### WebSocket `/ws/realtime`
 - Client → `{"type":"frame","image_base64":"..."}`
