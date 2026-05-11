@@ -5,14 +5,13 @@ Input shape : (N, T, F) dengan F = MAX_HANDS * 21 * 3
 Output shape: (N', T, F) setelah augment + balancing.
 
 Teknik:
-- Gaussian noise pada koordinat.
-- Scaling seragam (zoom tangan).
-- Rotasi 3D (sumbu z ≈ rotasi di bidang kamera), opsional yaw kecil di sumbu y.
-- Translasi landmark (shift posisi tangan).
-- Class balancing: oversample kelas minoritas sampai seimbang.
+- SPATIAL  : Gaussian noise, scaling, rotasi 3D, translasi.
+- TEMPORAL : speed variation, temporal jitter, random frame drop,
+             motion noise, sequence reverse, temporal shift.
+             Lihat `augmentation.temporal_augment`.
+- CLASS BALANCING : oversample kelas minoritas.
 
-Catatan: sample dengan tangan yang hilang (padding nol) TIDAK diaugment
-supaya padding tetap nol.
+Tangan yang hilang (padding nol) tidak diaugment secara spasial.
 """
 from __future__ import annotations
 
@@ -36,16 +35,15 @@ from config import (  # noqa: E402
     PROCESSED_DIR,
     RANDOM_SEED,
 )
+from augmentation.temporal_augment import temporal_augment  # noqa: E402
 
 
 def _reshape_frames(seq: np.ndarray) -> np.ndarray:
-    """(T, F) -> (T, MAX_HANDS, 21, 3)"""
     T = seq.shape[0]
     return seq.reshape(T, MAX_HANDS, NUM_LANDMARKS, 3)
 
 
 def _flatten_frames(arr: np.ndarray) -> np.ndarray:
-    """(T, MAX_HANDS, 21, 3) -> (T, F)"""
     return arr.reshape(arr.shape[0], -1)
 
 
@@ -59,7 +57,7 @@ def _rotation_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return Rz @ Ry @ Rx
 
 
-def augment_sequence(
+def spatial_augment(
     seq: np.ndarray,
     rng: np.random.Generator,
     noise_std: float = AUG_NOISE_STD,
@@ -67,11 +65,9 @@ def augment_sequence(
     rotation_deg: float = AUG_ROTATION_DEG,
     translation: float = AUG_TRANSLATION,
 ) -> np.ndarray:
-    """Augment satu sequence (T, F). Parameter diambil sekali per sequence
-    (konsisten antar-frame)."""
-    frames = _reshape_frames(seq.copy())  # (T, H, 21, 3)
+    """Augmentasi spasial per-sequence (parameter sama untuk semua frame)."""
+    frames = _reshape_frames(seq.copy())
 
-    # parameter tetap untuk seluruh sequence
     scale = rng.uniform(*scale_range)
     rz = np.deg2rad(rng.uniform(-rotation_deg, rotation_deg))
     ry = np.deg2rad(rng.uniform(-rotation_deg * 0.5, rotation_deg * 0.5))
@@ -79,26 +75,26 @@ def augment_sequence(
     R = _rotation_matrix(rx, ry, rz)
     tvec = rng.uniform(-translation, translation, size=(3,)).astype(np.float32)
 
-    # Mask tangan valid (bukan padding nol). Shape (H,).
-    # Tangan dianggap valid jika norm total-nya > 0 di sequence tsb.
-    hand_valid = np.abs(frames).reshape(MAX_HANDS, -1, order="F").sum(axis=1) > 0 \
-        if False else np.array(
-            [np.abs(frames[:, h, :, :]).sum() > 0 for h in range(MAX_HANDS)]
-        )
-
+    hand_valid = np.array(
+        [np.abs(frames[:, h, :, :]).sum() > 0 for h in range(MAX_HANDS)]
+    )
     for h in range(MAX_HANDS):
         if not hand_valid[h]:
-            continue  # biarkan padding nol
-        hand = frames[:, h, :, :]           # (T, 21, 3)
-        # rotasi + scale
+            continue
+        hand = frames[:, h, :, :]
         hand = hand @ R.T * scale
-        # translasi
         hand = hand + tvec
-        # noise
         hand = hand + rng.normal(0, noise_std, size=hand.shape).astype(np.float32)
         frames[:, h, :, :] = hand
 
     return _flatten_frames(frames).astype(np.float32)
+
+
+def augment_sequence(seq: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Temporal augment -> spatial augment (urutan penting)."""
+    seq = temporal_augment(seq, rng)
+    seq = spatial_augment(seq, rng)
+    return seq.astype(np.float32)
 
 
 def augment_dataset(
@@ -107,8 +103,7 @@ def augment_dataset(
     multiplier: int = AUG_MULTIPLIER,
     seed: int = RANDOM_SEED,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Setiap sample asli ditambah `multiplier` sample hasil augment.
-    Output mencakup sample asli + hasil augment."""
+    """Setiap sample asli + `multiplier` sample augment."""
     rng = np.random.default_rng(seed)
     aug_X = [X]
     aug_y = [y]
@@ -127,8 +122,7 @@ def balance_classes(
     y: np.ndarray,
     seed: int = RANDOM_SEED,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Oversample kelas minoritas sampai setara dengan kelas mayoritas
-    (random sampling dengan augmentation sekaligus)."""
+    """Oversample kelas minoritas via augmentation sampai setara."""
     rng = np.random.default_rng(seed)
     unique, counts = np.unique(y, return_counts=True)
     target = int(counts.max())
@@ -155,8 +149,8 @@ def main() -> None:
     X_path = PROCESSED_DIR / "X.npy"
     y_path = PROCESSED_DIR / "y.npy"
     if not (X_path.exists() and y_path.exists()):
-        print(f"[error] {X_path} atau {y_path} tidak ditemukan. "
-              f"Jalankan preprocessing.landmark_extractor terlebih dahulu.")
+        print(f"[error] {X_path} atau {y_path} tidak ditemukan.")
+        print("        Jalankan: python -m preprocessing.landmark_extractor")
         return
 
     X = np.load(X_path)
@@ -167,10 +161,10 @@ def main() -> None:
         f"Expected last dim {FEATURES_PER_FRAME}, got {X.shape[-1]}"
 
     X_aug, y_aug = augment_dataset(X, y)
-    print(f"[info] Augmented → X {X_aug.shape}, y {y_aug.shape}")
+    print(f"[info] Augmented -> X {X_aug.shape}, y {y_aug.shape}")
 
     X_bal, y_bal = balance_classes(X_aug, y_aug)
-    print(f"[info] Balanced  → X {X_bal.shape}, y {y_bal.shape}")
+    print(f"[info] Balanced  -> X {X_bal.shape}, y {y_bal.shape}")
 
     np.save(PROCESSED_DIR / "X_aug.npy", X_bal)
     np.save(PROCESSED_DIR / "y_aug.npy", y_bal)
