@@ -9,6 +9,8 @@ Teknik:
 - Scaling seragam (zoom tangan).
 - Rotasi 3D (sumbu z ≈ rotasi di bidang kamera), opsional yaw kecil di sumbu y.
 - Translasi landmark (shift posisi tangan).
+- **Temporal jitter**: mengacak urutan frame sedikit (±N frame) untuk
+  meningkatkan robustness temporal model terhadap variasi kecepatan gesture.
 - Class balancing: oversample kelas minoritas sampai seimbang.
 
 Catatan: sample dengan tangan yang hilang (padding nol) TIDAK diaugment
@@ -29,6 +31,7 @@ from config import (  # noqa: E402
     AUG_NOISE_STD,
     AUG_ROTATION_DEG,
     AUG_SCALE_RANGE,
+    AUG_TEMPORAL_JITTER,
     AUG_TRANSLATION,
     FEATURES_PER_FRAME,
     MAX_HANDS,
@@ -66,9 +69,23 @@ def augment_sequence(
     scale_range: Tuple[float, float] = AUG_SCALE_RANGE,
     rotation_deg: float = AUG_ROTATION_DEG,
     translation: float = AUG_TRANSLATION,
+    temporal_jitter: int = AUG_TEMPORAL_JITTER,
 ) -> np.ndarray:
     """Augment satu sequence (T, F). Parameter diambil sekali per sequence
-    (konsisten antar-frame)."""
+    (konsisten antar-frame).
+
+    Temporal jitter: menggeser setiap frame ±N posisi secara acak
+    (dengan clamp ke [0, T-1]). Ini mensimulasikan variasi kecepatan
+    gesture antar pengguna.
+    """
+    T = seq.shape[0]
+
+    # --- Temporal jitter (sebelum spatial augmentation) ---
+    if temporal_jitter > 0:
+        offsets = rng.integers(-temporal_jitter, temporal_jitter + 1, size=T)
+        new_indices = np.clip(np.arange(T) + offsets, 0, T - 1)
+        seq = seq[new_indices]
+
     frames = _reshape_frames(seq.copy())  # (T, H, 21, 3)
 
     # parameter tetap untuk seluruh sequence

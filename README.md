@@ -2,8 +2,11 @@
 
 Sistem Artificial Intelligence berbasis Machine Learning dan Computer Vision yang mampu
 mendeteksi bahasa isyarat **BISINDO (Bahasa Isyarat Indonesia)** secara real-time
-menggunakan webcam. Sistem mengenali gesture tangan berdasarkan huruf alfabet BISINDO
-(A–Z) serta 5 gesture kata tambahan: **Halo, Makan, Minum, Terima Kasih, Tolong**.
+menggunakan webcam. Sistem mengenali gesture tangan berdasarkan:
+- **Huruf alfabet BISINDO** (A–Z) — 26 kelas
+- **Angka** (0–9) — 10 kelas
+- **Gesture kata**: Halo, Makan, Minum, Terima Kasih, Tolong — 5 kelas
+- **Total 41 kelas** (otomatis bertambah via auto-detect label dari folder)
 
 ## Arsitektur Sistem
 
@@ -101,6 +104,7 @@ python -m dataset.download_from_drive \
 - Scaling acak (0.9–1.1).
 - Rotasi landmark pada sumbu kamera (±15°).
 - Translasi posisi tangan.
+- **Temporal jitter** (±2 frame) untuk simulasi variasi kecepatan gesture.
 - **Class balancing** via oversampling untuk kelas minoritas.
 
 ### 4. Model
@@ -108,7 +112,8 @@ Kombinasi **CNN + LSTM**:
 - `TimeDistributed(Conv1D + BN + Pool)` per frame landmark.
 - `LSTM(128) → LSTM(64)` untuk learning temporal.
 - `Dropout` + `BatchNormalization` untuk regularisasi.
-- `Dense(softmax)` output 31 kelas (26 alfabet + 5 kata).
+- `Dense(softmax)` output dinamis (41+ kelas: alfabet + angka + kata).
+- Multi-kategori: alfabet, angka, dan kata dalam satu model terpadu.
 
 ### 5. Training
 - Framework: TensorFlow / Keras.
