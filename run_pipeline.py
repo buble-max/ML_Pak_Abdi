@@ -39,6 +39,8 @@ def _run(module_or_script: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--download", action="store_true")
+    p.add_argument("--kaggle", action="store_true",
+                   help="unduh dataset Kaggle BISINDO 40 Kata MP4")
     p.add_argument("--record", action="store_true",
                    help="rekam klip frame .jpg per clip")
     p.add_argument("--record-live", action="store_true", dest="record_live",
@@ -58,6 +60,8 @@ def main() -> None:
 
     if args.all or args.download:
         _run("dataset.download_dataset")
+    if args.all or getattr(args, 'kaggle', False):
+        _run("dataset.download_kaggle")
     if args.record:
         _run("dataset.record_word_gestures")
     if args.record_live:

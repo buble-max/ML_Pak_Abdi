@@ -38,6 +38,11 @@ BISINDO_REPO_URL = (
 BISINDO_REPO_BRANCH = "master"
 BISINDO_DATASET_SUBDIR = "collectedimages"
 
+# Kaggle dataset (BISINDO 40 Kata MP4) — video gesture kata utuh (.mp4).
+# Slug: user/dataset-name pada Kaggle.
+KAGGLE_DATASET_SLUG = "anggiyohanespardede/bisindo-40-kata-mp4"
+MIN_VIDEOS_PER_CLASS = 3   # minimum video per kelas untuk lolos validasi
+
 # Kelas alfabet BISINDO (A-Z)
 ALPHABET_CLASSES = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 
