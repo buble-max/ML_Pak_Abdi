@@ -18,8 +18,8 @@ LOG_DIR = ROOT_DIR / "logs"
 for d in (RAW_DIR, WORD_RAW_DIR, PROCESSED_DIR, MODEL_DIR, LOG_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-MODEL_PATH = MODEL_DIR / "bisindo_model.h5"
-LABELS_PATH = MODEL_DIR / "labels.json"
+MODEL_PATH = MODEL_DIR / "bisindo_new.keras"
+LABELS_PATH = MODEL_DIR / "labels2.json"
 
 # ============================================================
 # DATASET
@@ -34,13 +34,60 @@ BISINDO_REPO_BRANCH = "master"
 BISINDO_DATASET_SUBDIR = "collectedimages"
 
 # Kelas alfabet BISINDO (A–Z)
-ALPHABET_CLASSES = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
+ABJAD_CLASSES = [chr(c) for c in range(ord("a"), ord("z") + 1)]
+ALPHABET_CLASSES = ABJAD_CLASSES
+DIGIT_CLASSES = [f"digit_{i}" for i in range(10)]
+WORD_CLASSES = [
+    "word_apa",
+    "word_apa_kabar",
+    "word_bagaimana",
+    "word_baik",
+    "word_belajar",
+    "word_berapa",
+    "word_berdiri",
+    "word_bingung",
+    "word_dia",
+    "word_dimana",
+    "word_duduk",
+    "word_halo",
+    "word_kalian",
+    "word_kami",
+    "word_kamu",
+    "word_kapan",
+    "word_kemana",
+    "word_kita",
+    "word_makan",
+    "word_mandi",
+    "word_marah",
+    "word_melihat",
+    "word_membaca",
+    "word_menulis",
+    "word_mereka",
+    "word_minum",
+    "word_pendek",
+    "word_ramah",
+    "word_sabar",
+    "word_saya",
+    "word_sedih",
+    "word_selamat_malam",
+    "word_selamat_pagi",
+    "word_selamat_siang",
+    "word_selamat_sore",
+    "word_senang",
+    "word_siapa",
+    "word_terima_kasih",
+    "word_tidur",
+    "word_tinggi",
+]
 
-# 5 gesture kata tambahan (bebas dipilih)
-WORD_CLASSES = ["HALO", "MAKAN", "MINUM", "TERIMA_KASIH", "TOLONG"]
-
-ALL_CLASSES = ALPHABET_CLASSES + WORD_CLASSES
-NUM_CLASSES = len(ALL_CLASSES)  # 31
+ALL_CLASSES = (
+    ABJAD_CLASSES[:4]
+    + DIGIT_CLASSES
+    + ABJAD_CLASSES[4:23]
+    + WORD_CLASSES
+    + ABJAD_CLASSES[23:]
+)
+NUM_CLASSES = len(ALL_CLASSES)  # 76
 
 # ============================================================
 # MEDIAPIPE

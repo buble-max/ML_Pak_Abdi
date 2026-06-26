@@ -19,7 +19,7 @@ Migrasi: sebelumnya menggunakan `mp.solutions.hands.Hands` yang sudah
 dihapus pada MediaPipe terbaru (Python 3.12). Sekarang menggunakan
 MediaPipe Tasks API (`HandLandmarker` + `hand_landmarker.task`).
 
-Mendukung SEMUA kelas (alfabet A-Z + 5 kata). Mode append: setiap kali
+Mendukung SEMUA kelas aktif (alfabet, digit, dan kata). Mode append: setiap kali
 script dijalankan, sample baru ditambahkan ke dataset yang sudah ada.
 
 Kontrol Keyboard:
@@ -268,7 +268,7 @@ def main() -> None:
                 label=ALL_CLASSES[label_idx],
                 label_idx=label_idx,
                 is_recording=is_recording,
-                buf_fill=len(buf._buf),
+                buf_fill=buf.fill_level,
                 buf_max=buf.seq_len,
                 session_count=session_count,
                 total_count=total_count,

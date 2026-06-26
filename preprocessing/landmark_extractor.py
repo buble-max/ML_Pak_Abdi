@@ -28,6 +28,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from config import (  # noqa: E402
     ALPHABET_CLASSES,
+    DIGIT_CLASSES,
     FEATURES_PER_FRAME,
     MAX_HANDS,
     PROCESSED_DIR,
@@ -41,6 +42,25 @@ from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper  # noqa: E402
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from utils.labels import build_label_maps, save_labels  # noqa: E402
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def _label_dir(root: Path, label: str) -> Path:
+    candidates = [
+        label,
+        label.upper(),
+        label.lower(),
+    ]
+    if label.startswith("word_"):
+        word = label.removeprefix("word_")
+        candidates.extend([word, word.upper(), word.lower()])
+
+    for candidate in dict.fromkeys(candidates):
+        path = root / candidate
+        if path.exists():
+            return path
+    return root / label
+
 
 def _get_landmarker(running_mode: str = "image") -> HandLandmarkerWrapper:
     """Factory HandLandmarker (MediaPipe Tasks API)."""
@@ -50,7 +70,7 @@ def _get_landmarker(running_mode: str = "image") -> HandLandmarkerWrapper:
 def extract_landmarks_from_image(
     image_bgr: np.ndarray,
     landmarker: HandLandmarkerWrapper,
-) -> np.ndarray:
+) -> Optional[np.ndarray]:
     """
     Ekstraksi 21 landmark per tangan (x, y, z) menggunakan MediaPipe
     Tasks API, lalu normalisasi dan padding ke MAX_HANDS.
@@ -58,8 +78,40 @@ def extract_landmarks_from_image(
     Return shape: (FEATURES_PER_FRAME,) = (MAX_HANDS * 21 * 3,).
     """
     hand_arrays: List[np.ndarray] = landmarker.detect_bgr(image_bgr)
+    if not hand_arrays:
+        return None
     normed = normalize_two_hands(hand_arrays, max_hands=MAX_HANDS)   # (MAX_HANDS,21,3)
     return flatten_frame(normed)                                     # (FEATURES_PER_FRAME,)
+
+
+def _extract_features_from_paths(
+    image_paths: List[Path],
+    landmarker: HandLandmarkerWrapper,
+) -> Optional[np.ndarray]:
+    feats: List[np.ndarray] = []
+    for path in image_paths:
+        img = cv2.imread(str(path))
+        if img is None:
+            continue
+        feat = extract_landmarks_from_image(img, landmarker)
+        if feat is None:
+            continue
+        feats.append(feat)
+
+    if not feats:
+        return None
+    return np.stack(feats, axis=0).astype(np.float32)
+
+
+def _pad_or_sample_sequence(frames: np.ndarray, seq_len: int) -> np.ndarray:
+    """Ubah frame landmark (M, F) menjadi sequence fixed (T, F)."""
+    frame_count = frames.shape[0]
+    if frame_count < seq_len:
+        pad = np.repeat(frames[-1:], seq_len - frame_count, axis=0)
+        return np.concatenate([frames, pad], axis=0).astype(np.float32)
+
+    idx = np.linspace(0, frame_count - 1, seq_len).astype(int)
+    return frames[idx].astype(np.float32)
 
 
 # ---------------------------------------------------------------
@@ -76,29 +128,19 @@ def static_images_to_sequences(
     lalu potong dengan sliding window menjadi banyak sequence (N, T, F).
     Jika total frame < seq_len, gambar akan diulang dan diberi jitter kecil.
     """
-    feats: List[np.ndarray] = []
-    for p in image_paths:
-        img = cv2.imread(str(p))
-        if img is None:
-            continue
-        feats.append(extract_landmarks_from_image(img, landmarker))
-
-    if not feats:
+    arr = _extract_features_from_paths(image_paths, landmarker)
+    if arr is None:
         return np.zeros((0, seq_len, FEATURES_PER_FRAME), dtype=np.float32)
 
-    arr = np.stack(feats, axis=0)  # (M, F)
-    M = arr.shape[0]
-
     # Jika terlalu pendek → repeat + jitter halus
-    if M < seq_len:
+    if arr.shape[0] < seq_len:
         rng = np.random.default_rng(42)
-        reps = int(np.ceil(seq_len * 2 / M))
+        reps = int(np.ceil(seq_len * 2 / arr.shape[0]))
         arr = np.tile(arr, (reps, 1))
         arr = arr + rng.normal(0, 1e-3, size=arr.shape).astype(np.float32)
-        M = arr.shape[0]
 
     sequences = []
-    for start in range(0, M - seq_len + 1, max(stride, 1)):
+    for start in range(0, arr.shape[0] - seq_len + 1, max(stride, 1)):
         sequences.append(arr[start : start + seq_len])
     if not sequences:
         sequences.append(arr[:seq_len])
@@ -117,26 +159,11 @@ def clip_to_sequence(
     if not frames:
         return None
 
-    feats = []
-    for f in frames:
-        img = cv2.imread(str(f))
-        if img is None:
-            continue
-        feats.append(extract_landmarks_from_image(img, landmarker))
-    if not feats:
+    arr = _extract_features_from_paths(frames, landmarker)
+    if arr is None:
         return None
 
-    arr = np.stack(feats, axis=0)  # (M, F)
-    # Padding / truncating ke seq_len
-    M = arr.shape[0]
-    if M < seq_len:
-        pad = np.repeat(arr[-1:], seq_len - M, axis=0)
-        arr = np.concatenate([arr, pad], axis=0)
-    else:
-        # downsample uniform
-        idx = np.linspace(0, M - 1, seq_len).astype(int)
-        arr = arr[idx]
-    return arr.astype(np.float32)  # (T, F)
+    return _pad_or_sample_sequence(arr, seq_len)
 
 
 # ---------------------------------------------------------------
@@ -153,19 +180,19 @@ def build_dataset(
     X: List[np.ndarray] = []
     y: List[int] = []
 
-    # ---- ALFABET (gambar statis) ----
+    # ---- ALFABET + DIGIT (gambar statis) ----
     #  Tasks API mode IMAGE: cocok untuk preprocessing batch.
     landmarker_static = _get_landmarker(running_mode="image")
     try:
-        for label in ALPHABET_CLASSES:
-            class_dir = raw_dir / label
+        for label in ALPHABET_CLASSES + DIGIT_CLASSES:
+            class_dir = _label_dir(raw_dir, label)
             if not class_dir.exists():
                 print(f"[skip] {label}: folder tidak ditemukan")
                 continue
 
             imgs = sorted(
-                [p for p in class_dir.iterdir()
-                 if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
+                p for p in class_dir.iterdir()
+                if p.suffix.lower() in IMAGE_EXTENSIONS
             )
             if not imgs:
                 print(f"[skip] {label}: kosong")
@@ -180,7 +207,7 @@ def build_dataset(
         #  Kita tetap gunakan mode IMAGE karena frame dari klip diproses
         #  satu per satu sebagai still image, bukan stream.
         for label in WORD_CLASSES:
-            class_dir = word_dir / label
+            class_dir = _label_dir(word_dir, label)
             if not class_dir.exists():
                 print(f"[skip] {label}: folder tidak ditemukan")
                 continue

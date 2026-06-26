@@ -38,6 +38,13 @@ class SequenceBuffer:
     def is_ready(self) -> bool:
         return len(self._buf) == self.seq_len
 
+    @property
+    def fill_level(self) -> int:
+        return len(self._buf)
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
     def get(self) -> Optional[np.ndarray]:
         if not self.is_ready():
             return None

@@ -6,8 +6,8 @@ Usage:
     python -m training.train --epochs 50 --batch 32 --use_raw
 
 Output:
-    model/saved/bisindo_model.h5
-    model/saved/labels.json
+    model/saved/bisindo_new.keras
+    model/saved/labels2.json
     logs/history.json
     logs/classification_report.txt
     logs/confusion_matrix.png
@@ -170,12 +170,19 @@ def main() -> None:
     test_loss, test_acc, *_rest = model.evaluate(X_te, y_te, verbose=0)
     print(f"[test] loss={test_loss:.4f}  acc={test_acc:.4f}")
 
+    class_indices = list(range(len(labels)))
     y_pred = model.predict(X_te, batch_size=args.batch, verbose=0).argmax(1)
-    report = classification_report(y_te, y_pred, target_names=labels, zero_division=0)
+    report = classification_report(
+        y_te,
+        y_pred,
+        labels=class_indices,
+        target_names=labels,
+        zero_division=0,
+    )
     (LOG_DIR / "classification_report.txt").write_text(report, encoding="utf-8")
     print(report)
 
-    cm = confusion_matrix(y_te, y_pred, labels=list(range(len(labels))))
+    cm = confusion_matrix(y_te, y_pred, labels=class_indices)
     np.save(LOG_DIR / "confusion_matrix.npy", cm)
     if not args.no_plot:
         _plot_confusion(cm, labels, LOG_DIR / "confusion_matrix.png")

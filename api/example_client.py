@@ -42,7 +42,7 @@ def demo_landmarks() -> None:
     seq = np.random.randn(SEQUENCE_LENGTH, FEATURES_PER_FRAME).astype(np.float32) * 0.1
     r = requests.post(
         f"{BASE}/predict/landmarks",
-        json={"sequence": seq.tolist()},
+        json={"sequence": seq.tolist(), "normalized": True},
         timeout=30,
     )
     print("status:", r.status_code)
@@ -103,7 +103,11 @@ async def demo_ws_landmarks() -> None:
                 feat = flatten_frame(
                     normalize_two_hands(hand_arrays, max_hands=2)
                 )
-                await ws.send(json.dumps({"type": "landmarks", "frame": feat.tolist()}))
+                await ws.send(json.dumps({
+                    "type": "landmarks",
+                    "frame": feat.tolist(),
+                    "normalized": True,
+                }))
                 resp = json.loads(await ws.recv())
                 if resp.get("type") == "prediction":
                     print(f"label={resp['label']:<12} conf={resp['confidence']:.2f}")

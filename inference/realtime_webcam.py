@@ -7,8 +7,7 @@ Loop:
     → (jika T frame penuh) predict_smooth → overlay label + confidence.
 
 Migrasi: menggunakan MediaPipe Tasks API (`HandLandmarker`) karena
-`mp.solutions.hands` sudah tidak tersedia pada MediaPipe terbaru
-(Python 3.12).
+`mp.solutions.hands` sudah tidak tersedia pada MediaPipe terbaru.
 
 Keyboard:
     q   : quit

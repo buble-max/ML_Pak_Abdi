@@ -40,8 +40,11 @@ from config import (  # noqa: E402
 
 def _reshape_frames(seq: np.ndarray) -> np.ndarray:
     """(T, F) -> (T, MAX_HANDS, 21, 3)"""
-    T = seq.shape[0]
-    return seq.reshape(T, MAX_HANDS, NUM_LANDMARKS, 3)
+    if seq.ndim != 2 or seq.shape[1] != FEATURES_PER_FRAME:
+        raise ValueError(
+            f"Expected sequence shape (T, {FEATURES_PER_FRAME}), got {seq.shape}"
+        )
+    return seq.reshape(seq.shape[0], MAX_HANDS, NUM_LANDMARKS, 3)
 
 
 def _flatten_frames(arr: np.ndarray) -> np.ndarray:
@@ -80,23 +83,14 @@ def augment_sequence(
     tvec = rng.uniform(-translation, translation, size=(3,)).astype(np.float32)
 
     # Mask tangan valid (bukan padding nol). Shape (H,).
-    # Tangan dianggap valid jika norm total-nya > 0 di sequence tsb.
-    hand_valid = np.abs(frames).reshape(MAX_HANDS, -1, order="F").sum(axis=1) > 0 \
-        if False else np.array(
-            [np.abs(frames[:, h, :, :]).sum() > 0 for h in range(MAX_HANDS)]
-        )
+    hand_valid = np.abs(frames).sum(axis=(0, 2, 3)) > 0
 
     for h in range(MAX_HANDS):
         if not hand_valid[h]:
             continue  # biarkan padding nol
-        hand = frames[:, h, :, :]           # (T, 21, 3)
-        # rotasi + scale
-        hand = hand @ R.T * scale
-        # translasi
-        hand = hand + tvec
-        # noise
-        hand = hand + rng.normal(0, noise_std, size=hand.shape).astype(np.float32)
-        frames[:, h, :, :] = hand
+        hand = frames[:, h, :, :]  # (T, 21, 3)
+        noise = rng.normal(0, noise_std, size=hand.shape).astype(np.float32)
+        frames[:, h, :, :] = (hand @ R.T * scale) + tvec + noise
 
     return _flatten_frames(frames).astype(np.float32)
 
@@ -109,6 +103,8 @@ def augment_dataset(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Setiap sample asli ditambah `multiplier` sample hasil augment.
     Output mencakup sample asli + hasil augment."""
+    if multiplier < 0:
+        raise ValueError("multiplier harus >= 0")
     rng = np.random.default_rng(seed)
     aug_X = [X]
     aug_y = [y]

@@ -53,3 +53,5 @@ runs/
 
 # Environment
 .env
+
+dataset/*.zip

@@ -38,7 +38,7 @@ Padding hingga 2 tangan  ──►  (42, 3) per frame  ──►  flatten 126-di
                     CNN+LSTM (TimeDistributed → LSTM → Dense)
                                                          │
                                                          ▼
-                                bisindo_model.h5
+                                bisindo_new.keras
                                                          │
                                                          ▼
                    Real-time inference (webcam) / API (FastAPI)
@@ -132,7 +132,7 @@ Keuntungan:
 - Kondisi data (pencahayaan, sudut kamera, karakteristik tangan user)
   identik dengan saat inference → generalisasi real-time lebih baik.
 - Tidak butuh dataset eksternal tambahan untuk menambah variasi.
-- Mendukung SEMUA kelas (alfabet A-Z + 5 kata) dalam satu script.
+- Mendukung SEMUA kelas aktif (alfabet, digit, dan kata) dalam satu script.
 
 `preprocessing.landmark_extractor.build_dataset()` otomatis menggabungkan
 `X_live.npy` ke dalam `X.npy` master saat tersedia, sehingga alur
@@ -169,7 +169,7 @@ Input (B, 30, 126)
 └─ BatchNormalization
 └─ Dense(128, ReLU, l2=1e-4)
 └─ Dropout(0.4)
-└─ Dense(31, softmax)
+└─ Dense(76, softmax)
 ```
 
 Parameter ~200K, kompatibel dengan Colab GPU T4/A100 & inference real-time CPU.

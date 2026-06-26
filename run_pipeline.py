@@ -3,8 +3,7 @@ Orchestrator: menjalankan seluruh pipeline BISINDO end-to-end.
 
 Tahapan (dapat dilewati via flag):
     1. --download      : unduh dataset BISINDO alfabet dari GitHub
-    2. --record        : rekam 5 gesture kata sebagai klip video
-                         (HALO, MAKAN, MINUM, TERIMA_KASIH, TOLONG)
+    2. --record        : rekam gesture kata sesuai WORD_CLASSES sebagai klip video
     3. --record-live   : rekam dataset manual landmark dari webcam → .npy
                          (mendukung semua kelas, append mode)
     4. --preprocess    : ekstraksi landmark + sliding window + .npy

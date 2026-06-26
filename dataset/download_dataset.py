@@ -88,8 +88,9 @@ def _copy_dataset_from_subdir(
     Ambil folder `<source_root>/**/<subdir>` (mis. `collectedimages/`) sebagai
     sumber dataset. Salin setiap subfolder label ke `raw_dir/<LABEL>/`.
 
-    Label dinormalisasi menjadi uppercase. Jika label tidak termasuk alfabet
-    A-Z, folder tetap disalin (mendukung label tambahan di masa depan).
+    Label dinormalisasi menjadi lowercase agar konsisten dengan labels2.json.
+    Jika label tidak termasuk alfabet a-z, folder tetap disalin (mendukung
+    label tambahan di masa depan).
     """
     # Cari folder `collectedimages` di mana pun di dalam tree (repo ZIP sering
     # ter-ekstrak di bawah folder bernama `<repo>-<branch>/`).
@@ -105,7 +106,7 @@ def _copy_dataset_from_subdir(
     for label_dir in sorted(src.iterdir()):
         if not label_dir.is_dir():
             continue
-        label = label_dir.name.strip().upper()
+        label = label_dir.name.strip().lower()
         target = raw_dir / label
         target.mkdir(parents=True, exist_ok=True)
 

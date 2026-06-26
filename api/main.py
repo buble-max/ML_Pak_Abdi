@@ -17,9 +17,9 @@ Menjalankan:
 from __future__ import annotations
 
 import base64
-import io
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -37,9 +37,14 @@ from config import (  # noqa: E402
     MAX_HANDS,
     MODEL_PATH,
     NUM_CLASSES,
+    NUM_LANDMARKS,
     SEQUENCE_LENGTH,
 )
-from inference.predictor import BisindoPredictor  # noqa: E402
+from inference.predictor import (  # noqa: E402
+    BisindoPredictor,
+    ModelLabelMismatchError,
+    PredictionSmoother,
+)
 from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper  # noqa: E402
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
 from preprocessing.sequence_builder import SequenceBuffer  # noqa: E402
@@ -49,7 +54,7 @@ from utils.labels import load_labels  # noqa: E402
 app = FastAPI(
     title="BISINDO Sign Language API",
     version="1.0.0",
-    description="API deteksi bahasa isyarat BISINDO (alfabet + 5 kata).",
+    description="API deteksi bahasa isyarat BISINDO (alfabet, digit, dan kata).",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -60,7 +65,17 @@ app.add_middleware(
 
 # --------------------------------------------------------------- Singletons
 _predictor: Optional[BisindoPredictor] = None
-_session_buffers: Dict[str, SequenceBuffer] = {}
+
+
+@dataclass
+class SessionState:
+    buffer: SequenceBuffer
+    smoother: PredictionSmoother
+    last_seen: float
+
+
+_sessions: Dict[str, SessionState] = {}
+SESSION_TTL_S = 30 * 60
 
 
 def _get_predictor() -> BisindoPredictor:
@@ -74,8 +89,41 @@ def _get_predictor() -> BisindoPredictor:
                     "Jalankan training terlebih dahulu."
                 ),
             )
-        _predictor = BisindoPredictor()
+        try:
+            _predictor = BisindoPredictor()
+        except ModelLabelMismatchError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _predictor
+
+
+def _new_session_state() -> SessionState:
+    return SessionState(
+        buffer=SequenceBuffer(),
+        smoother=PredictionSmoother(),
+        last_seen=time.time(),
+    )
+
+
+def _prune_sessions(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    expired = [
+        session_id
+        for session_id, state in _sessions.items()
+        if now - state.last_seen > SESSION_TTL_S
+    ]
+    for session_id in expired:
+        _sessions.pop(session_id, None)
+
+
+def _get_session(session_id: str, reset: bool = False) -> SessionState:
+    _prune_sessions()
+    state = _sessions.get(session_id)
+    if state is None or reset:
+        state = _new_session_state()
+        _sessions[session_id] = state
+    else:
+        state.last_seen = time.time()
+    return state
 
 
 def _get_landmarker() -> HandLandmarkerWrapper:
@@ -120,6 +168,7 @@ class HealthResponse(BaseModel):
     num_classes: int
     sequence_length: int
     features_per_frame: int
+    active_sessions: int
     uptime_s: float
 
 
@@ -133,7 +182,15 @@ class LandmarkPredictRequest(BaseModel):
         ...,
         description=(
             f"Shape ({SEQUENCE_LENGTH}, {FEATURES_PER_FRAME}). "
-            "Landmark sudah harus dinormalisasi."
+            "Default-nya landmark sudah dalam format siap-model/ternormalisasi."
+        ),
+    )
+    normalized: bool = Field(
+        True,
+        description=(
+            "True jika sequence sudah dinormalisasi seperti data training. "
+            "False jika sequence masih landmark mentah MediaPipe dan perlu "
+            "dinormalisasi server."
         ),
     )
 
@@ -160,7 +217,7 @@ def root():
     return {
         "name": "BISINDO Sign Language API",
         "endpoints": [
-            "/health", "/labels",
+            "/health", "/labels", "/classes", "/model/classes",
             "/predict/landmarks", "/predict/frame",
             "/ws/realtime",
         ],
@@ -169,19 +226,27 @@ def root():
 
 @app.get("/health", response_model=HealthResponse)
 def health():
+    _prune_sessions()
     loaded = False
+    num_classes = NUM_CLASSES
     try:
-        _get_predictor()
+        pred = _get_predictor()
         loaded = True
+        num_classes = len(pred.labels)
     except HTTPException:
         loaded = False
+        try:
+            num_classes = len(load_labels())
+        except Exception:
+            num_classes = NUM_CLASSES
     return HealthResponse(
         status="ok",
         model_loaded=loaded,
         model_path=str(MODEL_PATH),
-        num_classes=NUM_CLASSES,
+        num_classes=num_classes,
         sequence_length=SEQUENCE_LENGTH,
         features_per_frame=FEATURES_PER_FRAME,
+        active_sessions=len(_sessions),
         uptime_s=time.time() - _START_TIME,
     )
 
@@ -192,11 +257,32 @@ def get_labels():
     return LabelsResponse(labels=lab, num_classes=len(lab))
 
 
+@app.get("/classes", response_model=LabelsResponse)
+@app.get("/model/classes", response_model=LabelsResponse)
+def get_classes():
+    return get_labels()
+
+
 def _format_prediction(
     probs: np.ndarray, label: str, conf: float, labels: List[str], k: int = 5
 ) -> PredictionResponse:
-    top_idx = np.argsort(probs)[::-1][:k]
-    top_k = [{"label": labels[i], "confidence": float(probs[i])} for i in top_idx]
+    if not np.all(np.isfinite(probs)):
+        raise HTTPException(
+            status_code=500,
+            detail="Model menghasilkan probabilitas tidak valid.",
+        )
+    if len(probs) != len(labels):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Model menghasilkan {len(probs)} probabilitas, tetapi file label "
+                f"memiliki {len(labels)} label. Pastikan model dan file label "
+                "berasal dari training run yang sama."
+            ),
+        )
+
+    top_idx = np.argsort(probs)[::-1][: min(k, len(labels))]
+    top_k = [{labels[i]: float(probs[i])} for i in top_idx]
     return PredictionResponse(
         label=label,
         confidence=float(conf),
@@ -205,9 +291,16 @@ def _format_prediction(
     )
 
 
-@app.post("/predict/landmarks", response_model=PredictionResponse)
-def predict_landmarks(req: LandmarkPredictRequest):
-    arr = np.array(req.sequence, dtype=np.float32)
+def _empty_prediction() -> PredictionResponse:
+    return PredictionResponse(
+        label="...",
+        confidence=0.0,
+        top_k=[],
+        is_stable=False,
+    )
+
+
+def _validate_landmark_sequence(arr: np.ndarray) -> None:
     if arr.shape != (SEQUENCE_LENGTH, FEATURES_PER_FRAME):
         raise HTTPException(
             status_code=400,
@@ -216,9 +309,79 @@ def predict_landmarks(req: LandmarkPredictRequest):
                 f"diterima {arr.shape}"
             ),
         )
+    if not np.all(np.isfinite(arr)):
+        raise HTTPException(
+            status_code=400,
+            detail="Sequence hanya boleh berisi angka finite, bukan NaN/Infinity.",
+        )
+    if np.count_nonzero(arr) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Sequence tidak boleh all-zero. Kirim landmark tangan yang valid.",
+        )
+
+
+def _normalize_landmark_sequence(arr: np.ndarray) -> np.ndarray:
+    frames = arr.reshape(SEQUENCE_LENGTH, MAX_HANDS, NUM_LANDMARKS, 3)
+    normed = [
+        normalize_two_hands(_valid_hands(frame), max_hands=MAX_HANDS)
+        for frame in frames
+    ]
+    return np.stack(normed, axis=0).reshape(SEQUENCE_LENGTH, FEATURES_PER_FRAME)
+
+
+def _normalize_landmark_frame(frame: np.ndarray) -> np.ndarray:
+    hands = frame.reshape(MAX_HANDS, NUM_LANDMARKS, 3)
+    return normalize_two_hands(_valid_hands(hands), max_hands=MAX_HANDS).reshape(-1)
+
+
+def _valid_hands(frame_hands: np.ndarray) -> List[np.ndarray]:
+    return [hand for hand in frame_hands if np.count_nonzero(hand) > 0]
+
+
+def _landmark_sequence_to_array(sequence: List[List[float]]) -> np.ndarray:
+    try:
+        return np.array(sequence, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Sequence harus berupa matrix angka berukuran "
+                f"({SEQUENCE_LENGTH}, {FEATURES_PER_FRAME})."
+            ),
+        ) from exc
+
+
+@app.post("/predict/landmarks", response_model=PredictionResponse)
+def predict_landmarks(req: LandmarkPredictRequest):
+    arr = _landmark_sequence_to_array(req.sequence)
+    _validate_landmark_sequence(arr)
+    if not req.normalized:
+        arr = _normalize_landmark_sequence(arr)
     pred = _get_predictor()
-    label, conf, probs_ema = pred.predict_smooth(arr)
-    return _format_prediction(probs_ema, label, conf, pred.labels)
+    try:
+        probs = pred.predict_proba(arr)[0]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Gagal menjalankan prediksi model.",
+        ) from exc
+
+    top_idx = int(np.argmax(probs))
+    if top_idx >= len(pred.labels):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Model menghasilkan index kelas {top_idx}, tetapi file label "
+                f"hanya memiliki {len(pred.labels)} label. Pastikan model dan "
+                "file label berasal dari training run yang sama."
+            ),
+        )
+    label = pred.labels[top_idx]
+    conf = float(probs[top_idx])
+    return _format_prediction(probs, label, conf, pred.labels)
 
 
 @app.post("/predict/frame", response_model=PredictionResponse)
@@ -228,24 +391,22 @@ def predict_frame(req: FramePredictRequest):
     SequenceBuffer per session; prediksi mulai muncul setelah buffer terisi T frame.
     """
     pred = _get_predictor()
-
-    buf = _session_buffers.get(req.session_id)
-    if buf is None or req.reset:
-        buf = SequenceBuffer()
-        _session_buffers[req.session_id] = buf
-        pred.reset()
+    state = _get_session(req.session_id, reset=req.reset)
 
     img = _decode_image(req.image_base64)
     feat = _frame_to_landmarks(img)
-    buf.push(feat)
+    if np.count_nonzero(feat) == 0:
+        state.buffer.reset()
+        state.smoother.reset()
+        return _empty_prediction()
 
-    if not buf.is_ready():
-        labels = pred.labels
-        zeros = np.zeros(len(labels), dtype=np.float32)
-        return _format_prediction(zeros, "...", 0.0, labels)
+    state.buffer.push(feat)
 
-    sequence = buf.get()
-    label, conf, probs = pred.predict_smooth(sequence)
+    if not state.buffer.is_ready():
+        return _empty_prediction()
+
+    sequence = state.buffer.get()
+    label, conf, probs = pred.predict_smooth(sequence, smoother=state.smoother)
     return _format_prediction(probs, label, conf, pred.labels)
 
 
@@ -261,20 +422,27 @@ async def websocket_realtime(ws: WebSocket):
     await ws.accept()
     pred = _get_predictor()
     buf = SequenceBuffer()
-    pred.reset()
+    smoother = PredictionSmoother()
     try:
         while True:
             msg = await ws.receive_json()
             mtype = msg.get("type")
             if mtype == "reset":
                 buf.reset()
-                pred.reset()
+                smoother.reset()
                 await ws.send_json({"type": "reset_ack"})
                 continue
 
             if mtype == "frame":
                 img = _decode_image(msg["image_base64"])
                 feat = _frame_to_landmarks(img)
+                if np.count_nonzero(feat) == 0:
+                    buf.reset()
+                    smoother.reset()
+                    await ws.send_json(
+                        {"type": "prediction", **_empty_prediction().model_dump()}
+                    )
+                    continue
             elif mtype == "landmarks":
                 feat = np.array(msg["frame"], dtype=np.float32)
                 if feat.shape != (FEATURES_PER_FRAME,):
@@ -283,6 +451,20 @@ async def websocket_realtime(ws: WebSocket):
                          "detail": f"frame shape harus ({FEATURES_PER_FRAME},)"}
                     )
                     continue
+                if not np.all(np.isfinite(feat)):
+                    await ws.send_json(
+                        {"type": "error",
+                         "detail": "frame hanya boleh berisi angka finite."}
+                    )
+                    continue
+                if np.count_nonzero(feat) == 0:
+                    await ws.send_json(
+                        {"type": "error",
+                         "detail": "frame tidak boleh all-zero."}
+                    )
+                    continue
+                if not bool(msg.get("normalized", True)):
+                    feat = _normalize_landmark_frame(feat)
             else:
                 await ws.send_json({"type": "error", "detail": f"type tidak dikenal: {mtype}"})
                 continue
@@ -290,13 +472,12 @@ async def websocket_realtime(ws: WebSocket):
             buf.push(feat)
             if not buf.is_ready():
                 await ws.send_json(
-                    {"type": "prediction", "label": "...", "confidence": 0.0,
-                     "is_stable": False, "top_k": []}
+                    {"type": "prediction", **_empty_prediction().model_dump()}
                 )
                 continue
 
             sequence = buf.get()
-            label, conf, probs = pred.predict_smooth(sequence)
+            label, conf, probs = pred.predict_smooth(sequence, smoother=smoother)
             resp = _format_prediction(probs, label, conf, pred.labels)
             await ws.send_json({"type": "prediction", **resp.model_dump()})
     except WebSocketDisconnect:

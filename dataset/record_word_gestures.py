@@ -1,5 +1,5 @@
 """
-Merekam 5 gesture kata BISINDO tambahan (HALO, MAKAN, MINUM, TERIMA_KASIH, TOLONG)
+Merekam gesture kata BISINDO tambahan sesuai WORD_CLASSES di config.py
 langsung dari webcam.
 
 Setiap kata direkam sebanyak N klip × T frame dan disimpan sebagai gambar:
