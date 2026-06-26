@@ -1,6 +1,14 @@
 # Sistem Deteksi Bahasa Isyarat BISINDO
 
-Menjalankan API:
+Sistem Artificial Intelligence berbasis Machine Learning dan Computer Vision yang mampu
+mendeteksi bahasa isyarat **BISINDO (Bahasa Isyarat Indonesia)** secara real-time
+menggunakan webcam. Sistem mengenali gesture tangan berdasarkan:
+- **Huruf alfabet BISINDO** (A–Z) — 26 kelas
+- **Angka** (0–9) — 10 kelas
+- **Gesture kata**: Halo, Makan, Minum, Terima Kasih, Tolong — 5 kelas
+- **Total 41 kelas** (otomatis bertambah via auto-detect label dari folder)
+
+## Arsitektur Sistem
 
 ```bash
 python -m api.main
@@ -326,15 +334,21 @@ python -m preprocessing.landmark_extractor
 
 Tahapan yang dilakukan:
 
-1. Membaca gambar dari `dataset/raw/`.
-2. Membaca clip gesture kata dari `dataset/raw_words/`.
-3. Mengekstraksi landmark tangan dengan MediaPipe Tasks API.
-4. Menormalisasi landmark.
-5. Membuat sequence sepanjang 30 frame.
-6. Menggabungkan dataset live dari `dataset/processed/live/` jika ada.
-7. Menyimpan output ke `dataset/processed/`.
+### 3. Augmentation
+- Gaussian noise pada koordinat landmark.
+- Scaling acak (0.9–1.1).
+- Rotasi landmark pada sumbu kamera (±15°).
+- Translasi posisi tangan.
+- **Temporal jitter** (±2 frame) untuk simulasi variasi kecepatan gesture.
+- **Class balancing** via oversampling untuk kelas minoritas.
 
-Output:
+### 4. Model
+Kombinasi **CNN + LSTM**:
+- `TimeDistributed(Conv1D + BN + Pool)` per frame landmark.
+- `LSTM(128) → LSTM(64)` untuk learning temporal.
+- `Dropout` + `BatchNormalization` untuk regularisasi.
+- `Dense(softmax)` output dinamis (41+ kelas: alfabet + angka + kata).
+- Multi-kategori: alfabet, angka, dan kata dalam satu model terpadu.
 
 ```text
 dataset/processed/X.npy

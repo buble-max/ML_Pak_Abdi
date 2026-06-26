@@ -20,3 +20,5 @@ matplotlib
 pandas
 requests
 gdown
+
+kaggle

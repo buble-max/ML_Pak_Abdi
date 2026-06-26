@@ -1,159 +1,229 @@
 # Arsitektur Sistem BISINDO
 
-Dokumentasi teknis lengkap pipeline, format data, dan keputusan desain.
+Dokumentasi teknis lengkap pipeline, format data, keputusan desain, dan
+kriteria evaluasi sistem.
+
+---
 
 ## 1. Alur Data End-to-End
 
 ```
-Dataset Mentah (gambar / klip video / landmark live .npy)
+Sumber Dataset:
+  - Gambar statis      : dataset/raw/<LABEL>/*.jpg
+  - Klip frame folder  : dataset/raw_words/<LABEL>/clip_*/frame_*.jpg
+  - Video utuh         : dataset/raw_videos/<LABEL>/*.mp4|.avi|.mov|...
+  - Live recorder      : dataset/processed/live/{X_live,y_live}.npy
         │
         ▼
-MediaPipe Hand Landmarker  ──►  21 titik (x,y,z) per tangan
+Video Ingestion (OpenCV VideoCapture)
+  - probe_video -> frame_count, fps, (w, h)
+  - temporal sampling: uniform | stride | random | adaptive
         │
         ▼
-Normalisasi  (wrist-centered + scale(wrist ↔ middle_MCP))
+MediaPipe Tasks API (HandLandmarker)  -> 21 titik (x, y, z) per tangan
         │
         ▼
-Padding hingga 2 tangan  ──►  (42, 3) per frame  ──►  flatten 126-dim
+Normalisasi (wrist-centered + scale via wrist <-> middle_MCP)
         │
         ▼
-┌── Static (alfabet) ──► Sliding window stride 5, T=30 ──┐
-│                                                        │
-├── Klip video (kata)  ─► Uniform resample ke T=30 ──────┤
-│                                                        │
-└── Landmark live .npy ─► SequenceBuffer di webcam ──────┘
-                                                         ▼
-                               X.npy (N, 30, 126) + y.npy (N,)
-                                                         │
-                                                         ▼
-                      Augment × AUG_MULTIPLIER  +  Class balancing
-                                                         │
-                                                         ▼
-                           X_aug.npy, y_aug.npy
-                                                         │
-                                                         ▼
-                        Train/Val/Test stratified 70/15/15
-                                                         │
-                                                         ▼
-                    CNN+LSTM (TimeDistributed → LSTM → Dense)
-                                                         │
-                                                         ▼
-                                bisindo_new.keras
-                                                         │
-                                                         ▼
-                   Real-time inference (webcam) / API (FastAPI)
+Padding 2 tangan (42, 3) per frame -> flatten 126-dim
+        │
+        ▼
+Temporal Resampler (interpolate / pad_last / pad_zero / trim_*)
+  -> sequence panjang tetap (T, F)
+        │
+        ▼
+X.npy (N, T, F) + y.npy (N,)
+        │
+        ▼
+Augment:
+  Temporal  : speed, jitter, frame drop, motion noise, reverse, shift
+  Spatial   : noise, scale, rotate 3D, translate
+  Balancing : oversample kelas minoritas
+        │
+        ▼
+Train/Val/Test split (rasio configurable: 70/15/15, 30/70, ...)
+        │
+        ▼
+CNN + LSTM (TimeDistributed -> LSTM -> Dense)
+        │
+        ▼
+bisindo_model.h5
+        │
+        ▼
+Real-time inference (webcam) / API (FastAPI) / Video file inference
 ```
 
-## 2. Format Landmark per Frame
+---
+
+## 2. Kelas Gesture yang Didukung
+
+| Kategori   | Kelas                          | Jumlah |
+| ---------- | ------------------------------ | ------ |
+| Alfabet    | A – Z                          | 26     |
+| Angka      | 0 – 9                          | 10     |
+| Kata       | HALO, MAKAN, MINUM, TERIMA_KASIH, TOLONG | 5 |
+| **Total**  |                                | **41** |
+
+Sistem mendukung **auto-detect label**: cukup tambah folder baru di
+`dataset/raw/<LABEL>/` atau `dataset/raw_words/<LABEL>/` dan label baru
+otomatis terdeteksi tanpa edit `config.py` (selama `AUTO_DETECT_LABELS=True`).
+
+---
+
+## 3. Format Landmark per Frame
 
 ```
 frame_vector (126,) =
-  [hand_0_landmark_0_x,   hand_0_landmark_0_y,   hand_0_landmark_0_z,
-   hand_0_landmark_1_x,   hand_0_landmark_1_y,   hand_0_landmark_1_z,
-   ...
-   hand_0_landmark_20_x,  hand_0_landmark_20_y,  hand_0_landmark_20_z,
-   hand_1_landmark_0_x,   ..., hand_1_landmark_20_z]
+  [hand_0_lm_0_x, hand_0_lm_0_y, hand_0_lm_0_z,
+   hand_0_lm_1_x, ..., hand_0_lm_20_z,
+   hand_1_lm_0_x, ..., hand_1_lm_20_z]
 ```
 
-Tangan diurutkan dari kiri ke kanan berdasarkan x-wrist. Jika hanya satu
-tangan terdeteksi, slot tangan kedua diisi nol (padding) dan dilewati dari
-augmentasi agar tetap nol.
+Tangan diurutkan kiri→kanan berdasarkan x-wrist. Slot kosong diisi nol.
 
-## 3. Normalisasi
+---
 
-### 3a. Ekstraksi Landmark via MediaPipe Tasks API
+## 4. Normalisasi & Ekstraksi Landmark
 
-Sejak MediaPipe versi terbaru (Python 3.12), API lama
-`mp.solutions.hands.Hands` dan `mp.solutions.drawing_utils` **sudah dihapus**
-dan memunculkan error:
+### MediaPipe Tasks API
 
-```
-AttributeError: module 'mediapipe' has no attribute 'solutions'
-```
+API lama `mp.solutions.hands` dihapus di MediaPipe terbaru (Python 3.12).
+Sistem menggunakan `HandLandmarker` dari `mediapipe.tasks.python.vision`:
 
-Seluruh pipeline preprocessing, real-time webcam, dan API sekarang
-menggunakan **MediaPipe Tasks API** (`mediapipe.tasks.python.vision.HandLandmarker`)
-via wrapper `preprocessing/mp_hand_landmarker.py`:
+| Konteks              | Running Mode | Method                          |
+| -------------------- | ------------ | ------------------------------- |
+| Batch preprocessing  | IMAGE        | `landmarker.detect(mp_img)`     |
+| Webcam streaming     | VIDEO        | `landmarker.detect_for_video()` |
 
-| Konteks                        | Running mode | Fungsi                 |
-| ------------------------------ | ------------ | ---------------------- |
-| Preprocessing batch (gambar)   | `IMAGE`      | `landmarker.detect()`  |
-| Webcam real-time               | `VIDEO`      | `landmarker.detect_for_video(img, ts_ms)` |
-| API `/predict/frame` (REST)    | `IMAGE`      | `landmarker.detect()`  |
+Model `hand_landmarker.task` auto-download ke `model/mp_assets/`.
 
-Model asset `hand_landmarker.task` otomatis diunduh dari Google Cloud Storage
-ke `model/mp_assets/` pada penggunaan pertama. Drawing 21 titik + koneksi
-jari dilakukan lewat helper `draw_hand_landmarks()` (karena
-`mp.solutions.drawing_utils` juga tidak tersedia pada Tasks API).
+### Normalisasi Koordinat
 
-### 3b. Normalisasi Koordinat
+1. **Translasi**: origin di wrist (landmark[0]).
+2. **Skala**: dibagi `||landmark[9]||` (jarak wrist ↔ middle MCP).
 
-Invarian terhadap:
-- **Posisi tangan**: semua titik dikurangi `landmark[0]` (wrist).
-- **Ukuran tangan / jarak kamera**: dibagi `||landmark[9]||` (jarak
-  wrist ↔ middle MCP) pasca-translasi. Jika < 1e-6, diganti 1.
-- **Perbedaan antar pengguna**: kombinasi dua normalisasi di atas sudah
-  menyerap mayoritas variasi ukuran/posisi.
+---
 
-## 4. Sliding Window (static images)
+## 5. Konfigurasi Sequence Training
 
-Dataset BISINDO sumber berupa gambar statis yang berasal dari folder
-`collectedimages/` pada repo
-[rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset](https://github.com/rhiosutoyo/Indonesian-Sign-Language-BISINDO-Hand-Sign-Detection-Dataset).
-Karena dataset tidak disediakan dalam arsip `.zip`, pengambilan dilakukan
-dengan `git clone` repo penuh lalu menyalin subfolder per-label dari
-`collectedimages/<LABEL>/` ke `dataset/raw/<LABEL>/`. Setelah itu:
+Semua parameter berada di `config.py` dan dapat diubah fleksibel:
 
-1. Ekstrak vektor landmark untuk setiap gambar.
-2. Susun vektor-vektor tersebut berurutan (per kelas) menjadi array (M, 126).
-3. Jika `M < T`, replikasi + tambahkan jitter halus (σ=1e-3) agar tetap
-   bervariasi.
-4. Ambil sliding window `arr[s : s+T]` dengan stride `WINDOW_STRIDE`.
+| Parameter            | Default       | Deskripsi                                         |
+| -------------------- | ------------- | ------------------------------------------------- |
+| `SEQUENCE_LENGTH`    | 30            | Jumlah frame per sample (T)                       |
+| `WINDOW_STRIDE`      | 5             | Hop antar sliding window                          |
+| `SEQUENCE_OVERLAP`   | 0.83          | Overlap ratio (menggantikan WINDOW_STRIDE jika > 0) |
+| `FRAME_STRIDE`       | 1             | Interval pengambilan frame (1=semua, 2=skip 1, dst) |
+| `TEMPORAL_SAMPLING`  | "uniform"     | "uniform" / "stride" / "random" / "adaptive"      |
+| `TEMPORAL_PADDING`   | "interpolate" | "interpolate" / "pad_last" / "pad_zero"           |
+| `VIDEO_SLIDING_WINDOW` | False       | True = video panjang -> banyak sequence per video |
+| `VAL_SPLIT`          | 0.15          | Rasio validasi                                    |
+| `TEST_SPLIT`         | 0.15          | Rasio test                                        |
 
-Hasil: satu kelas alfabet menghasilkan banyak sequence "pseudo-temporal"
-yang dapat dipelajari LSTM.
+**Contoh konfigurasi rasio**:
+- 70/15/15: `VAL_SPLIT=0.15, TEST_SPLIT=0.15` (default)
+- 80/10/10: `VAL_SPLIT=0.10, TEST_SPLIT=0.10`
+- 30/70 (no test): `VAL_SPLIT=0.70, TEST_SPLIT=0.0`
 
-### 4b. Dataset Live (langsung dari webcam → .npy)
+---
 
-Sumber dataset ketiga: pengguna merekam landmark langsung dari kamera
-laptop via `dataset/record_landmarks_live.py`. Alurnya:
+## 5b. Video-Based Temporal Training Pipeline
 
-1. OpenCV menangkap frame real-time dari webcam.
-2. Setiap frame diproses MediaPipe → 21 landmark (x, y, z) per tangan.
-3. Landmark dinormalisasi (sama persis dengan pipeline static/video).
-4. Hasil flatten dimasukkan ke `SequenceBuffer` berukuran T=30.
-5. Saat buffer penuh, sequence (T, F) otomatis disimpan ke memori;
-   buffer direset sehingga sample berikutnya bisa direkam segera
-   (multi-sample per sesi tanpa jeda).
-6. Saat user menekan `s`/`q`, seluruh data ditulis ke
-   `dataset/processed/live/{X_live.npy, y_live.npy}` (append mode).
+Sejak upgrade ini, pipeline tidak lagi hanya mengandalkan gambar statis
+atau folder klip frame — sistem dapat memproses **file video utuh** sebagai
+satu sequence temporal asli.
 
-Keuntungan:
-- Kondisi data (pencahayaan, sudut kamera, karakteristik tangan user)
-  identik dengan saat inference → generalisasi real-time lebih baik.
-- Tidak butuh dataset eksternal tambahan untuk menambah variasi.
-- Mendukung SEMUA kelas aktif (alfabet, digit, dan kata) dalam satu script.
+### Video Ingestion (`preprocessing/video_ingestion.py`)
+- `probe_video(path)` — baca `frame_count`, `fps`, dimensi.
+- `iter_video_frames(path)` — streaming frame tanpa memuat seluruh video.
+- `read_video_frames(path, ...)` — decode + pilih frame berdasarkan
+  `TEMPORAL_SAMPLING`:
+  - **uniform**: `np.linspace(0, N-1, T)`
+  - **stride**: ambil tiap frame ke-`FRAME_STRIDE`, lalu uniform di atasnya
+  - **random**: pilih T frame acak (sorted)
+  - **adaptive**: stride dulu untuk mengurangi redundansi → uniform
 
-`preprocessing.landmark_extractor.build_dataset()` otomatis menggabungkan
-`X_live.npy` ke dalam `X.npy` master saat tersedia, sehingga alur
-augment → train tidak perlu dimodifikasi.
+### Temporal Resampler (`preprocessing/temporal_resampler.py`)
+- `interpolate_to_length(arr, T)` — linear interpolation antar frame.
+- `pad_sequence(arr, T, mode)` — pad_last / pad_zero.
+- `trim_sequence(arr, T, mode)` — trim_center / trim_start / trim_end.
+- `resample_to_fixed_length(...)` — high-level: kombinasi interpolate +
+  padding + trimming untuk menghasilkan shape `(T, F)` yang konsisten.
 
-## 5. Augmentation
+### Dua Strategi Video -> Training Sample
+1. **1 video = 1 sample** (default, `VIDEO_SLIDING_WINDOW=False`):
+   seluruh video di-sample `T` frame lalu di-resample ke `(T, F)`.
+2. **Sliding window** (`VIDEO_SLIDING_WINDOW=True`): decode semua frame
+   (dengan `FRAME_STRIDE`), lalu sliding window di ruang landmark dengan
+   `SEQUENCE_OVERLAP` / `WINDOW_STRIDE`. Cocok untuk gesture kalimat
+   panjang yang mengandung beberapa token gesture.
 
-Satu set parameter acak **per sequence** (konsisten antar frame) supaya
-konsistensi temporal tetap terjaga:
+### Webcam Video Recorder (`dataset/record_video_gestures.py`)
+Merekam gesture langsung sebagai video `.mp4` **dan** menghasilkan
+landmark sequence `.npy` secara simultan. Video tersimpan ke
+`dataset/raw_videos/<LABEL>/clip_XXXX.mp4` dan landmark langsung masuk
+ke `dataset/processed/live/{X_live,y_live}.npy` — siap pakai training
+tanpa preprocessing tambahan.
 
-| Teknik      | Range                   | Tujuan                          |
-| ----------- | ----------------------- | ------------------------------- |
-| Noise       | N(0, 0.01)              | Menyimulasikan jitter MediaPipe |
-| Scaling     | Uniform [0.9, 1.1]      | Ukuran tangan bervariasi        |
-| Rotasi 3D   | ±15° (z), ±7.5° (x,y)   | Rotasi di bidang kamera + yaw   |
-| Translasi   | ±0.05                   | Posisi tangan di frame          |
+### Video File Inference
+- CLI: `python -m inference.video_inference path/to/video.mp4 [--sliding]`
+- API: `POST /predict/video` (multipart `file=...`, opsional `sliding=true`).
 
-Kelas minoritas di-oversample sampai setara kelas terbesar (augment baru
-pada tiap sampel). Padding tangan kosong tidak diaugment.
+---
 
-## 6. Arsitektur Model
+## 6. Sliding Window & Dynamic Sequence Management
+
+### Gambar Statis (alfabet + angka)
+1. Ekstrak landmark → array (M, 126).
+2. Jika `M < T`: repeat + jitter (σ=1e-3).
+3. Sliding window `arr[s : s+T]` dengan stride dari `SEQUENCE_OVERLAP` atau
+   `WINDOW_STRIDE`.
+
+### Klip Video (kata + angka dinamis)
+1. Frame di-skip setiap `FRAME_STRIDE` frame.
+2. Jika total frame > T:
+   - `TEMPORAL_SAMPLING="uniform"`: linspace sampling.
+   - `TEMPORAL_SAMPLING="random"`: random N frame (sorted).
+3. Jika total < T: padding repeat frame terakhir.
+
+### Live Webcam
+1. `SequenceBuffer` (deque maxlen=T) mengumpulkan frame real-time.
+2. Saat penuh → simpan / predict; buffer direset otomatis.
+
+---
+
+## 7. Augmentasi Temporal & Spasial
+
+Urutan augment: **temporal dulu -> baru spatial**.
+
+### Temporal (`augmentation/temporal_augment.py`)
+
+| Teknik               | Parameter                   | Deskripsi                                    |
+| -------------------- | --------------------------- | -------------------------------------------- |
+| Speed variation      | `AUG_SPEED_RANGE=(0.8,1.2)` | Resample dengan faktor kecepatan acak        |
+| Temporal jitter      | `AUG_TEMPORAL_JITTER=2`     | Shift frame ±N (clamp)                       |
+| Random frame drop    | `AUG_FRAME_DROP_PROB=0.05`  | Drop frame acak lalu interpolate kembali ke T|
+| Motion noise         | `AUG_MOTION_NOISE_STD=0.003`| Smooth random-walk drift antar frame         |
+| Sequence reverse     | `AUG_REVERSE_PROB=0.0`      | Balik urutan (default disabled, gesture asimetris) |
+| Temporal shift       | `AUG_TEMPORAL_SHIFT=3`      | Circular shift ±N frame                      |
+
+### Spatial
+
+| Teknik            | Parameter                    | Deskripsi                                  |
+| ----------------- | ---------------------------- | ------------------------------------------ |
+| Gaussian noise    | `AUG_NOISE_STD=0.01`         | Noise pada koordinat landmark              |
+| Scaling           | `AUG_SCALE_RANGE=(0.9,1.1)`  | Zoom seragam                               |
+| Rotasi 3D         | `AUG_ROTATION_DEG=15`        | ±15° (z), ±7.5° (x,y)                      |
+| Translasi         | `AUG_TRANSLATION=0.05`       | Shift posisi tangan                        |
+| Class balancing   | automatic                    | Oversample kelas minoritas via augment     |
+
+Semua augment mempertahankan padding nol (tangan hilang) kecuali motion
+noise yang hanya diterapkan pada tangan valid.
+
+---
+
+## 8. Arsitektur Model CNN + LSTM
 
 ```
 Input (B, 30, 126)
@@ -169,62 +239,129 @@ Input (B, 30, 126)
 └─ BatchNormalization
 └─ Dense(128, ReLU, l2=1e-4)
 └─ Dropout(0.4)
-└─ Dense(76, softmax)
+└─ Dense(NUM_CLASSES, softmax)
 ```
 
-Parameter ~200K, kompatibel dengan Colab GPU T4/A100 & inference real-time CPU.
+- **TimeDistributed CNN**: ekstraksi fitur spasial (hubungan antar landmark
+  dalam satu frame).
+- **LSTM layers**: pemodelan temporal (hubungan antar frame dalam sequence).
+- **Dropout + BN**: regularisasi, mencegah overfitting.
+- Output dinamis berdasarkan `NUM_CLASSES` (auto-computed dari label).
 
-## 7. Anti-Flicker Real-Time
+---
+
+## 9. Training & Callbacks
+
+| Callback              | Parameter              | Fungsi                          |
+| --------------------- | ---------------------- | ------------------------------- |
+| EarlyStopping         | patience=15            | Stop jika val_acc tidak naik    |
+| ReduceLROnPlateau     | patience=5, factor=0.5 | Kurangi LR saat val_loss stagnan |
+| ModelCheckpoint       | save_best_only=True    | Simpan model terbaik ke .h5     |
+| CSVLogger             |                        | Log metrics per epoch           |
+
+---
+
+## 10. Anti-Flicker Real-Time
 
 ```
-         probs = model.predict(sequence)[0]
-         prob_ema = α * probs + (1-α) * prob_ema         # smoothing
-         top_idx  = argmax(prob_ema)
-         pred_buf.append(top_idx)
-         vote, cnt = most_common(pred_buf)
+probs = model.predict(sequence)[0]
+prob_ema = α * probs + (1-α) * prob_ema         # EMA smoothing
+top_idx  = argmax(prob_ema)
+pred_buf.append(top_idx)                         # buffer deque
+vote, cnt = most_common(pred_buf)
 
-         if cnt >= MIN_VOTES and prob_ema[top_idx] ≥ THRESHOLD:
-             emit label  else emit "..."
+if cnt >= MIN_VOTES and prob_ema[top_idx] ≥ THRESHOLD:
+    emit label
+else:
+    emit "..."
 ```
 
-Parameter default:
-- `BUFFER_SIZE = 10`
-- `SMOOTHING_MIN_VOTES = 6`
-- `CONFIDENCE_THRESHOLD = 0.70`
-- `EMA α = 0.6`
+Default: `BUFFER_SIZE=10`, `SMOOTHING_MIN_VOTES=6`, `CONFIDENCE_THRESHOLD=0.70`, `EMA α=0.6`.
 
-## 8. API Contract
+---
 
-### REST
+## 11. API Contract (FastAPI)
 
-**POST /predict/landmarks**
-```json
-{ "sequence": [[...126 floats...], ... (30 baris) ...] }
-```
-→
-```json
-{ "label": "A", "confidence": 0.87, "is_stable": true,
-  "top_k": [{"label":"A","confidence":0.87}, ...] }
-```
+### REST Endpoints
 
-**POST /predict/frame**
-```json
-{ "session_id": "uuid", "image_base64": "data:image/jpeg;base64,...",
-  "reset": false }
-```
+| Method | Endpoint             | Input                                    | Output                 |
+| ------ | -------------------- | ---------------------------------------- | ---------------------- |
+| GET    | `/health`            | -                                        | status + model info    |
+| GET    | `/labels`            | -                                        | list of classes        |
+| POST   | `/predict/landmarks` | sequence (T×F floats)                    | PredictionResponse     |
+| POST   | `/predict/frame`     | session_id + base64 image                | PredictionResponse     |
+| POST   | `/predict/video`     | multipart file + opsional `sliding=true` | VideoPredictResponse   |
 
 ### WebSocket `/ws/realtime`
 - Client → `{"type":"frame","image_base64":"..."}`
-- Client → `{"type":"landmarks","frame":[... 126 floats ...]}`
+- Client → `{"type":"landmarks","frame":[126 floats]}`
 - Client → `{"type":"reset"}`
-- Server → `{"type":"prediction", "label":..., "confidence":..., "top_k":[...]}`
+- Server → `{"type":"prediction","label":...,"confidence":...,"top_k":[...]}`
 
-## 9. Keputusan Desain
-- **Landmark bukan pixel**: jauh lebih robust terhadap latar, pencahayaan.
-- **2 tangan**: BISINDO banyak gesture dua-tangan, berbeda dari SIBI.
-- **CNN sebelum LSTM**: Conv1D melihat tetangga landmark (struktur tangan),
-  LSTM melihat temporal → pemisahan concerns yang bersih.
+---
+
+## 12. Kriteria Evaluasi Sistem
+
+Evaluasi menyeluruh mencakup:
+
+### A. Pipeline Dataset
+- [x] Multi-source: gambar statis, klip video, webcam live recording
+- [x] Auto-detect label dari folder tanpa mapping manual
+- [x] Import dataset dari Google Drive via gdown (tanpa upload manual)
+- [x] Rekam multi-sample langsung ke .npy (append mode)
+
+### B. Preprocessing & Temporal Processing
+- [x] MediaPipe Tasks API (`HandLandmarker`) stabil di Python 3.12
+- [x] 21 landmark (x,y,z) per tangan, 2 tangan terdeteksi
+- [x] Normalisasi wrist-centered + scale invariant
+- [x] Sliding window sequence (T × 21 × 3) configurable
+- [x] FRAME_STRIDE untuk temporal downsampling
+- [x] TEMPORAL_SAMPLING: uniform atau random
+- [x] SEQUENCE_OVERLAP sebagai alternatif WINDOW_STRIDE
+
+### C. Augmentasi
+- [x] Spatial: noise, scaling, rotasi 3D, translasi
+- [x] Temporal: jitter ±N frame
+- [x] Class balancing otomatis (oversample minoritas)
+
+### D. Model & Training
+- [x] CNN + LSTM dengan TimeDistributed, BN, Dropout
+- [x] Multi-kategori: alfabet + angka + kata (41 kelas)
+- [x] Configurable train/val/test split ratio
+- [x] EarlyStopping + ReduceLROnPlateau + ModelCheckpoint
+- [x] Training GPU via Google Colab notebook
+- [x] Export .h5 + labels.json
+
+### E. Real-Time Inference
+- [x] Deteksi gesture langsung dari webcam
+- [x] Anti-flicker: prediction buffer + EMA + confidence threshold
+- [x] FPS overlay + landmark visualization
+- [x] Reset buffer via keyboard
+
+### F. API Deployment
+- [x] FastAPI: /health, /labels, /predict/landmarks, /predict/frame
+- [x] WebSocket /ws/realtime streaming
+- [x] CORS enabled, session-based buffer management
+- [x] Kompatibel untuk integrasi web & mobile
+
+### G. Full AI Pipeline Architecture
+- [x] Dataset generation (multi-source + auto-label)
+- [x] Video-based temporal preprocessing (configurable)
+- [x] Configurable sequence training parameters
+- [x] Deep Learning training (GPU accelerated)
+- [x] Real-time webcam inference (anti-flicker)
+- [x] API deployment berbasis AI service
+
+---
+
+## 13. Keputusan Desain
+
+- **Landmark bukan pixel**: robust terhadap latar, pencahayaan.
+- **2 tangan**: BISINDO banyak gesture dua-tangan (berbeda dari SIBI).
+- **CNN sebelum LSTM**: Conv1D melihat tetangga landmark (struktur spasial),
+  LSTM melihat temporal → separation of concerns.
+- **Temporal jitter**: mensimulasikan variasi kecepatan gesture.
 - **EMA + vote buffer**: EMA menghaluskan probabilitas kontinu, vote buffer
-  memberi keputusan diskrit yang stabil → mengatasi flicker.
-- **SequenceBuffer per API session**: memungkinkan frontend mengirim frame
-  satu-per-satu tanpa harus mengelola buffer di sisi klien.
+  memberi keputusan diskrit stabil.
+- **Auto-detect labels**: scalable — tambah kelas cukup buat folder baru.
+- **Configurable split/overlap/stride**: memudahkan eksperimen tanpa edit code.

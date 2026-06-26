@@ -2,14 +2,17 @@
 FastAPI server BISINDO.
 
 Endpoints:
-    GET  /                     → info singkat
-    GET  /health               → status API & model
-    GET  /labels               → daftar kelas
-    POST /predict/landmarks    → input sequence landmark (T x F) → prediksi
-    POST /predict/frame        → input 1 frame gambar (base64) → ekstrak + buffer
-                                 → prediksi (stateless, perlu kirim banyak frame
-                                 berurutan via session_id yang sama)
-    WS   /ws/realtime          → streaming prediksi real-time (frame-by-frame)
+    GET  /                     -> info singkat
+    GET  /health               -> status API & model
+    GET  /labels               -> daftar kelas
+    POST /predict/landmarks    -> input sequence landmark (T x F) -> prediksi
+    POST /predict/frame        -> input 1 frame gambar (base64) -> ekstrak + buffer
+                                  -> prediksi (stateless, perlu kirim banyak frame
+                                  berurutan via session_id yang sama)
+    POST /predict/video        -> upload file video (.mp4/.avi/...) -> prediksi
+                                  1 video = 1 label, atau mode sliding window
+                                  untuk gesture kalimat/panjang.
+    WS   /ws/realtime          -> streaming prediksi real-time (frame-by-frame)
 
 Menjalankan:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -18,13 +21,17 @@ from __future__ import annotations
 
 import base64
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI, File, Form, HTTPException, UploadFile,
+    WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -34,16 +41,17 @@ from config import (  # noqa: E402
     API_HOST,
     API_PORT,
     FEATURES_PER_FRAME,
+    FRAME_STRIDE,
     MAX_HANDS,
     MODEL_PATH,
     NUM_CLASSES,
     NUM_LANDMARKS,
     SEQUENCE_LENGTH,
+    TEMPORAL_SAMPLING,
 )
-from inference.predictor import (  # noqa: E402
-    BisindoPredictor,
-    ModelLabelMismatchError,
-    PredictionSmoother,
+from inference.predictor import BisindoPredictor  # noqa: E402
+from preprocessing.landmark_extractor import (  # noqa: E402
+    video_to_sequence, video_to_sequences_sliding,
 )
 from preprocessing.mp_hand_landmarker import HandLandmarkerWrapper  # noqa: E402
 from preprocessing.normalizer import flatten_frame, normalize_two_hands  # noqa: E402
@@ -208,6 +216,22 @@ class FramePredictRequest(BaseModel):
     reset: bool = False
 
 
+class VideoWindowResult(BaseModel):
+    window: int
+    label: str
+    confidence: float
+    top_k: List[Dict[str, float]]
+
+
+class VideoPredictResponse(BaseModel):
+    mode: str  # "single" | "sliding"
+    label: Optional[str] = None
+    confidence: Optional[float] = None
+    top_k: Optional[List[Dict[str, float]]] = None
+    num_windows: Optional[int] = None
+    windows: Optional[List[VideoWindowResult]] = None
+
+
 _START_TIME = time.time()
 
 
@@ -217,8 +241,8 @@ def root():
     return {
         "name": "BISINDO Sign Language API",
         "endpoints": [
-            "/health", "/labels", "/classes", "/model/classes",
-            "/predict/landmarks", "/predict/frame",
+            "/health", "/labels",
+            "/predict/landmarks", "/predict/frame", "/predict/video",
             "/ws/realtime",
         ],
     }
@@ -408,6 +432,82 @@ def predict_frame(req: FramePredictRequest):
     sequence = state.buffer.get()
     label, conf, probs = pred.predict_smooth(sequence, smoother=state.smoother)
     return _format_prediction(probs, label, conf, pred.labels)
+
+
+@app.post("/predict/video", response_model=VideoPredictResponse)
+async def predict_video(
+    file: UploadFile = File(..., description="File video (.mp4/.avi/.mov/.mkv/.webm)"),
+    sliding: bool = Form(False, description="Jika True, sliding window di ruang landmark untuk kalimat panjang"),
+):
+    """
+    Upload video utuh -> ekstraksi 21 landmark per frame via MediaPipe Tasks API
+    -> temporal resampling ke T frame -> prediksi CNN+LSTM.
+
+    Mode default (sliding=False): 1 video = 1 label.
+    Mode sliding=True            : banyak prediksi (per window) sepanjang video.
+    """
+    pred = _get_predictor()
+    landmarker = _get_landmarker()
+
+    suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(prefix="bisindo_", suffix=suffix, delete=False)
+    try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="File video kosong.")
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        video_path = Path(tmp.name)
+
+        if sliding:
+            seqs = video_to_sequences_sliding(
+                video_path, landmarker,
+                seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE,
+            )
+            windows: List[VideoWindowResult] = []
+            for i, s in enumerate(seqs):
+                probs = pred.predict_proba(s)[0]
+                top = int(np.argmax(probs))
+                top_idx = np.argsort(probs)[::-1][:5]
+                windows.append(VideoWindowResult(
+                    window=i,
+                    label=pred.labels[top],
+                    confidence=float(probs[top]),
+                    top_k=[{"label": pred.labels[int(j)],
+                            "confidence": float(probs[int(j)])} for j in top_idx],
+                ))
+            return VideoPredictResponse(
+                mode="sliding",
+                num_windows=len(windows),
+                windows=windows,
+            )
+
+        seq = video_to_sequence(
+            video_path, landmarker,
+            seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE,
+            mode=TEMPORAL_SAMPLING,
+        )
+        if seq is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Gagal mengekstrak landmark dari video.",
+            )
+        probs = pred.predict_proba(seq)[0]
+        top = int(np.argmax(probs))
+        top_idx = np.argsort(probs)[::-1][:5]
+        return VideoPredictResponse(
+            mode="single",
+            label=pred.labels[top],
+            confidence=float(probs[top]),
+            top_k=[{"label": pred.labels[int(j)],
+                    "confidence": float(probs[int(j)])} for j in top_idx],
+        )
+    finally:
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @app.websocket("/ws/realtime")
